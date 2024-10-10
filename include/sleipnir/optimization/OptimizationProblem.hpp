@@ -29,7 +29,7 @@ namespace sleipnir {
  * This class allows the user to pose a constrained nonlinear optimization
  * problem in natural mathematical notation and solve it.
  *
- * This class supports problems of the form:
+ * This class supports problems that can be converted to the form:
 @verbatim
       minₓ f(x)
 subject to cₑ(x) = 0
@@ -183,16 +183,23 @@ class SLEIPNIR_DLLEXPORT OptimizationProblem {
    * @param constraint The constraint to satisfy.
    */
   void SubjectTo(const EqualityConstraints& constraint) {
-    // Get the highest order equality constraint expression type
+    // Get the highest order expression type of the equality constraint passed
+    // by the user, before conversion to two inequalities
     for (const auto& c : constraint.constraints) {
       status.equalityConstraintType =
           std::max(status.equalityConstraintType, c.Type());
     }
 
-    m_equalityConstraints.reserve(m_equalityConstraints.size() +
-                                  constraint.constraints.size());
-    std::copy(constraint.constraints.begin(), constraint.constraints.end(),
-              std::back_inserter(m_equalityConstraints));
+    m_combinedInequalityConstraints.reserve(
+        m_combinedInequalityConstraints.size() +
+        2 * constraint.constraints.size());
+    for (const auto& c : constraint.constraints) {
+      // Used only for bookkeeping
+      m_equalityConstraints.emplace_back(c);
+      // Equivalent since cₑ(x) = 0 iff cₑ(x) ≥ 0 and -cₑ(x) ≥ 0
+      m_combinedInequalityConstraints.emplace_back(c);
+      m_combinedInequalityConstraints.emplace_back(-c);
+    }
   }
 
   /**
@@ -202,16 +209,23 @@ class SLEIPNIR_DLLEXPORT OptimizationProblem {
    * @param constraint The constraint to satisfy.
    */
   void SubjectTo(EqualityConstraints&& constraint) {
-    // Get the highest order equality constraint expression type
+    // Get the highest order expression type of the equality constraint passed
+    // by the user, before conversion to two inequalities
     for (const auto& c : constraint.constraints) {
       status.equalityConstraintType =
           std::max(status.equalityConstraintType, c.Type());
     }
 
-    m_equalityConstraints.reserve(m_equalityConstraints.size() +
-                                  constraint.constraints.size());
-    std::copy(constraint.constraints.begin(), constraint.constraints.end(),
-              std::back_inserter(m_equalityConstraints));
+    m_combinedInequalityConstraints.reserve(
+        m_combinedInequalityConstraints.size() +
+        2 * constraint.constraints.size());
+    for (const auto& c : constraint.constraints) {
+      // Used only for bookkeeping
+      m_equalityConstraints.emplace_back(c);
+      // Equivalent since cₑ(x) = 0 iff cₑ(x) ≥ 0 and -cₑ(x) ≥ 0
+      m_combinedInequalityConstraints.emplace_back(c);
+      m_combinedInequalityConstraints.emplace_back(-c);
+    }
   }
 
   /**
@@ -227,10 +241,10 @@ class SLEIPNIR_DLLEXPORT OptimizationProblem {
           std::max(status.inequalityConstraintType, c.Type());
     }
 
-    m_inequalityConstraints.reserve(m_inequalityConstraints.size() +
-                                    constraint.constraints.size());
+    m_combinedInequalityConstraints.reserve(
+        m_combinedInequalityConstraints.size() + constraint.constraints.size());
     std::copy(constraint.constraints.begin(), constraint.constraints.end(),
-              std::back_inserter(m_inequalityConstraints));
+              std::back_inserter(m_combinedInequalityConstraints));
   }
 
   /**
@@ -246,10 +260,10 @@ class SLEIPNIR_DLLEXPORT OptimizationProblem {
           std::max(status.inequalityConstraintType, c.Type());
     }
 
-    m_inequalityConstraints.reserve(m_inequalityConstraints.size() +
-                                    constraint.constraints.size());
+    m_combinedInequalityConstraints.reserve(
+        m_combinedInequalityConstraints.size() + constraint.constraints.size());
     std::copy(constraint.constraints.begin(), constraint.constraints.end(),
-              std::back_inserter(m_inequalityConstraints));
+              std::back_inserter(m_combinedInequalityConstraints));
   }
 
   /**
@@ -260,10 +274,7 @@ class SLEIPNIR_DLLEXPORT OptimizationProblem {
    */
   SolverStatus Solve(const SolverConfig& config = SolverConfig{}) {
     // Create the initial value column vector
-    Eigen::VectorXd x{m_decisionVariables.size()};
-    for (size_t i = 0; i < m_decisionVariables.size(); ++i) {
-      x(i) = m_decisionVariables[i].Value();
-    }
+    Eigen::VectorXd x = VariableMatrix{m_decisionVariables}.Value();
 
     status.exitCondition = SolverExitCondition::kSuccess;
 
@@ -291,10 +302,16 @@ class SLEIPNIR_DLLEXPORT OptimizationProblem {
       // Print problem dimensionality
       sleipnir::println("Number of decision variables: {}",
                         m_decisionVariables.size());
-      sleipnir::println("Number of equality constraints: {}",
-                        m_equalityConstraints.size());
-      sleipnir::println("Number of inequality constraints: {}\n",
-                        m_inequalityConstraints.size());
+      sleipnir::println(
+          "Number of equality constraints: "
+          "{}\n",
+          m_equalityConstraints.size());
+      sleipnir::println(
+          "Number of inequality constraints (before addition of converted "
+          "equalities): "
+          "{}\n",
+          m_combinedInequalityConstraints.size() -
+              m_equalityConstraints.size());
     }
 
     // If the problem is empty or constant, there's nothing to do
@@ -304,11 +321,40 @@ class SLEIPNIR_DLLEXPORT OptimizationProblem {
       return status;
     }
 
+    // Check for an overconstrained problem
+    if (m_equalityConstraints.size() > m_decisionVariables.size()) {
+      if (config.diagnostics) {
+        sleipnir::println("The problem has too few degrees of freedom.");
+        sleipnir::println(
+            "Violated constraints (cₑ(x) = 0) in order of declaration:");
+        VariableMatrix c_eAD{m_equalityConstraints};
+        Eigen::VectorXd c_e = c_eAD.Value();
+        for (Eigen::Index row = 0; row < c_e.rows(); ++row) {
+          if (c_e(row) < 0.0) {
+            sleipnir::println("  {}/{}: {} = 0", row + 1, c_e.rows(), c_e(row));
+          }
+        }
+      }
+
+      status.exitCondition = SolverExitCondition::kTooFewDOFs;
+      return status;
+    }
+
+    // TODO(declan): THIS IS A HACK---the one-phase paper, hence our solver,
+    // expects constraints of the form cᵢ(x) ≤ 0, even though the original Julia
+    // implementation expects the opposite. It would be faster to convert
+    // constraints to this form as we receive them, but I would like to
+    // eventually refactor the solver itself, so I'm keeping this easy-to-remove
+    // here.
+    for (auto& constraint : m_combinedInequalityConstraints) {
+      constraint = -constraint;
+    }
+
     // Solve the optimization problem
-    Eigen::VectorXd s = Eigen::VectorXd::Ones(m_inequalityConstraints.size());
-    InteriorPoint(m_decisionVariables, m_equalityConstraints,
-                  m_inequalityConstraints, m_f.value(), m_callback, config,
-                  false, x, s, &status);
+    Eigen::VectorXd s =
+        Eigen::VectorXd::Ones(m_combinedInequalityConstraints.size());
+    InteriorPoint(m_decisionVariables, {}, m_combinedInequalityConstraints,
+                  m_f.value(), m_callback, config, false, x, s, &status);
 
     if (config.diagnostics) {
       sleipnir::println("Exit condition: {}", ToMessage(status.exitCondition));
@@ -363,11 +409,13 @@ class SLEIPNIR_DLLEXPORT OptimizationProblem {
   // The cost function: f(x)
   std::optional<Variable> m_f;
 
-  // The list of equality constraints: cₑ(x) = 0
-  small_vector<Variable> m_equalityConstraints;
+  // The list of inequality constraints: cᵢ(x) ≥ 0; includes converted equality
+  // constraints
+  small_vector<Variable> m_combinedInequalityConstraints;
 
-  // The list of inequality constraints: cᵢ(x) ≥ 0
-  small_vector<Variable> m_inequalityConstraints;
+  // The list of equality constraints: cₑ(x) = 0; each underlying Expression is
+  // also pointed to by one element of m_inequalityConstraints
+  small_vector<Variable> m_equalityConstraints;
 
   // The user callback
   std::function<bool(const SolverIterationInfo& info)> m_callback =

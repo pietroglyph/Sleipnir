@@ -311,7 +311,7 @@ void InteriorPoint(std::span<Variable> decisionVariables,
     }
 
     // Call user callback
-    if (callback({iterations, x, s, g, H, A_e, A_i})) {
+    if (callback({iterations, x, s, g, H, A_i})) {
       status->exitCondition = SolverExitCondition::kCallbackRequestedStop;
       return;
     }

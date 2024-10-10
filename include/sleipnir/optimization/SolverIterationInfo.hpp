@@ -17,7 +17,7 @@ struct SolverIterationInfo {
   /// The decision variables.
   const Eigen::VectorXd& x;
 
-  /// The inequality constraint slack variables.
+  /// The inequality constraint slack variables (includes converted equality constraints).
   const Eigen::VectorXd& s;
 
   /// The gradient of the cost function.
@@ -26,10 +26,7 @@ struct SolverIterationInfo {
   /// The Hessian of the Lagrangian.
   const Eigen::SparseMatrix<double>& H;
 
-  /// The equality constraint Jacobian.
-  const Eigen::SparseMatrix<double>& A_e;
-
-  /// The inequality constraint Jacobian.
+  /// The inequality constraint Jacobian (includes converted equality constraints).
   const Eigen::SparseMatrix<double>& A_i;
 };
 

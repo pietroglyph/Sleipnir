@@ -16,10 +16,16 @@ struct SLEIPNIR_DLLEXPORT SolverStatus {
   /// The cost function type detected by the solver.
   ExpressionType costFunctionType = ExpressionType::kNone;
 
-  /// The equality constraint type detected by the solver.
+  /// The expression type of the equality constraints as given by the user;
+  /// these are converted to equivalent inequality constraints before being
+  /// passed to the solver―i.e., the solver operates on only inequality
+  /// constraints of type max(equalityConstraintType, inequalityConstraintType).
   ExpressionType equalityConstraintType = ExpressionType::kNone;
 
-  /// The inequality constraint type detected by the solver.
+  /// The expression type of the inequality constraints as given by the user;
+  /// these are converted to equivalent inequality constraints before being
+  /// passed to the solver―i.e., the solver operates on only inequality
+  /// constraints of type max(equalityConstraintType, inequalityConstraintType).
   ExpressionType inequalityConstraintType = ExpressionType::kNone;
 
   /// The solver's exit condition.

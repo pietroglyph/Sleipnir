@@ -27,21 +27,21 @@ static const char *__doc_Eigen_NumTraits =
 R"doc(NumTraits specialization that allows instantiating Eigen types with
 Variable.)doc";
 
-static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_tav_git_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3 = R"doc()doc";
+static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_declan_work_src_github_com_pietroglyph_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3 = R"doc()doc";
 
-static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_tav_git_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_AddCost = R"doc()doc";
+static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_declan_work_src_github_com_pietroglyph_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_AddCost = R"doc()doc";
 
-static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_tav_git_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_IsComplex = R"doc()doc";
+static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_declan_work_src_github_com_pietroglyph_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_IsComplex = R"doc()doc";
 
-static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_tav_git_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_IsInteger = R"doc()doc";
+static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_declan_work_src_github_com_pietroglyph_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_IsInteger = R"doc()doc";
 
-static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_tav_git_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_IsSigned = R"doc()doc";
+static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_declan_work_src_github_com_pietroglyph_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_IsSigned = R"doc()doc";
 
-static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_tav_git_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_MulCost = R"doc()doc";
+static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_declan_work_src_github_com_pietroglyph_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_MulCost = R"doc()doc";
 
-static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_tav_git_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_ReadCost = R"doc()doc";
+static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_declan_work_src_github_com_pietroglyph_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_ReadCost = R"doc()doc";
 
-static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_tav_git_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_RequireInitialization = R"doc()doc";
+static const char *__doc_Eigen_NumTraits_unnamed_enum_at_home_declan_work_src_github_com_pietroglyph_Sleipnir_include_sleipnir_autodiff_Variable_hpp_750_3_RequireInitialization = R"doc()doc";
 
 static const char *__doc_sleipnir_Block =
 R"doc(Assemble a VariableMatrix from a nested list of blocks.
@@ -582,8 +582,8 @@ static const char *__doc_sleipnir_OptimizationProblem =
 R"doc(This class allows the user to pose a constrained nonlinear
 optimization problem in natural mathematical notation and solve it.
 
-This class supports problems of the form: @verbatim minₓ f(x) subject
-to cₑ(x) = 0 cᵢ(x) ≥ 0 @endverbatim
+This class supports problems that can be converted to the form:
+@verbatim minₓ f(x) subject to cₑ(x) = 0 cᵢ(x) ≥ 0 @endverbatim
 
 where f(x) is the scalar cost function, x is the vector of decision
 variables (variables the solver can tweak to minimize the cost
@@ -715,13 +715,13 @@ Parameter ``rows``:
 
 static const char *__doc_sleipnir_OptimizationProblem_m_callback = R"doc()doc";
 
+static const char *__doc_sleipnir_OptimizationProblem_m_combinedInequalityConstraints = R"doc()doc";
+
 static const char *__doc_sleipnir_OptimizationProblem_m_decisionVariables = R"doc()doc";
 
 static const char *__doc_sleipnir_OptimizationProblem_m_equalityConstraints = R"doc()doc";
 
 static const char *__doc_sleipnir_OptimizationProblem_m_f = R"doc()doc";
-
-static const char *__doc_sleipnir_OptimizationProblem_m_inequalityConstraints = R"doc()doc";
 
 static const char *__doc_sleipnir_OptimizationProblem_status = R"doc()doc";
 
@@ -858,8 +858,8 @@ this many iterations.)doc";
 static const char *__doc_sleipnir_SolverConfig_maxIterations = R"doc(The maximum number of solver iterations before returning a solution.)doc";
 
 static const char *__doc_sleipnir_SolverConfig_spy =
-R"doc(Enables writing sparsity patterns of H, Aₑ, and Aᵢ to files named
-H.spy, A_e.spy, and A_i.spy respectively during solve.
+R"doc(Enables writing sparsity patterns of H and Aᵢ to files named H.spy and
+A_i.spy, respectively, during solve.
 
 Use tools/spy.py to plot them.)doc";
 
@@ -907,9 +907,9 @@ static const char *__doc_sleipnir_SolverExitCondition_kTooFewDOFs = R"doc(The so
 
 static const char *__doc_sleipnir_SolverIterationInfo = R"doc(Solver iteration information exposed to a user callback.)doc";
 
-static const char *__doc_sleipnir_SolverIterationInfo_A_e = R"doc(The equality constraint Jacobian.)doc";
-
-static const char *__doc_sleipnir_SolverIterationInfo_A_i = R"doc(The inequality constraint Jacobian.)doc";
+static const char *__doc_sleipnir_SolverIterationInfo_A_i =
+R"doc(The inequality constraint Jacobian (includes converted equality
+constraints).)doc";
 
 static const char *__doc_sleipnir_SolverIterationInfo_H = R"doc(The Hessian of the Lagrangian.)doc";
 
@@ -917,7 +917,9 @@ static const char *__doc_sleipnir_SolverIterationInfo_g = R"doc(The gradient of 
 
 static const char *__doc_sleipnir_SolverIterationInfo_iteration = R"doc(The solver iteration.)doc";
 
-static const char *__doc_sleipnir_SolverIterationInfo_s = R"doc(The inequality constraint slack variables.)doc";
+static const char *__doc_sleipnir_SolverIterationInfo_s =
+R"doc(The inequality constraint slack variables (includes converted equality
+constraints).)doc";
 
 static const char *__doc_sleipnir_SolverIterationInfo_x = R"doc(The decision variables.)doc";
 
@@ -929,11 +931,21 @@ static const char *__doc_sleipnir_SolverStatus_cost = R"doc(The solution's cost.
 
 static const char *__doc_sleipnir_SolverStatus_costFunctionType = R"doc(The cost function type detected by the solver.)doc";
 
-static const char *__doc_sleipnir_SolverStatus_equalityConstraintType = R"doc(The equality constraint type detected by the solver.)doc";
+static const char *__doc_sleipnir_SolverStatus_equalityConstraintType =
+R"doc(The expression type of the equality constraints as given by the user;
+these are converted to equivalent inequality constraints before being
+passed to the solver―i.e., the solver operates on only inequality
+constraints of type max(equalityConstraintType,
+inequalityConstraintType).)doc";
 
 static const char *__doc_sleipnir_SolverStatus_exitCondition = R"doc(The solver's exit condition.)doc";
 
-static const char *__doc_sleipnir_SolverStatus_inequalityConstraintType = R"doc(The inequality constraint type detected by the solver.)doc";
+static const char *__doc_sleipnir_SolverStatus_inequalityConstraintType =
+R"doc(The expression type of the inequality constraints as given by the
+user; these are converted to equivalent inequality constraints before
+being passed to the solver―i.e., the solver operates on only
+inequality constraints of type max(equalityConstraintType,
+inequalityConstraintType).)doc";
 
 static const char *__doc_sleipnir_TimestepMethod = R"doc(Enum describing the type of system timestep.)doc";
 
