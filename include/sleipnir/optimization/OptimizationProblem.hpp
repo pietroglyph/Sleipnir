@@ -345,16 +345,14 @@ class SLEIPNIR_DLLEXPORT OptimizationProblem {
     // implementation expects the opposite. It would be faster to convert
     // constraints to this form as we receive them, but I would like to
     // eventually refactor the solver itself, so I'm keeping this easy-to-remove
-    // here.
+    // switcharoo here.
     for (auto& constraint : m_combinedInequalityConstraints) {
       constraint = -constraint;
     }
 
     // Solve the optimization problem
-    Eigen::VectorXd s =
-        Eigen::VectorXd::Ones(m_combinedInequalityConstraints.size());
-    InteriorPoint(m_decisionVariables, {}, m_combinedInequalityConstraints,
-                  m_f.value(), m_callback, config, false, x, s, &status);
+    InteriorPoint(m_decisionVariables, m_combinedInequalityConstraints,
+                  m_f.value(), m_callback, config, x, &status);
 
     if (config.diagnostics) {
       sleipnir::println("Exit condition: {}", ToMessage(status.exitCondition));

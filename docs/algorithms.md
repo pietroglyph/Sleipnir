@@ -188,3 +188,7 @@ Section 6 of [^3] describes how to check for local infeasibility.
 [^3]: Byrd, R. and Nocedal J. and Waltz R. "KNITRO: An Integrated Package for Nonlinear Optimization", 2005. [https://users.iems.northwestern.edu/~nocedal/PDFfiles/integrated.pdf](https://users.iems.northwestern.edu/~nocedal/PDFfiles/integrated.pdf)
 
 [^4]: Hinder, O. and Ye, Y. "A one-phase interior point method for nonconvex optimization", 2018. [https://arxiv.org/pdf/1801.03072.pdf](https://arxiv.org/pdf/1801.03072.pdf)
+
+[^5]: M. Gertz, J. Nocedal, and A. Sartenar. A starting point strategy for nonlinear interior methods. Applied mathematics letters, 17(8):945–952, 2004. [https://doi.org/10.1016/j.aml.2003.09.005](https://doi.org/10.1016/j.aml.2003.09.005)
+
+[^6]: S. Mehrotra. On the implementation of a primal-dual interior point method. SIAM Journal on optimization, 2(4):575–601, 1992. [https://doi.org/10.1137/0802028](https://doi.org/10.1137/0802028)

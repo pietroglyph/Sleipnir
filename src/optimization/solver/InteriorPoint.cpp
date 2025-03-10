@@ -11,19 +11,21 @@
 #include <Eigen/SparseCholesky>
 
 #include "optimization/RegularizedLDLT.hpp"
-#include "optimization/solver/util/ErrorEstimate.hpp"
-#include "optimization/solver/util/FeasibilityRestoration.hpp"
 #include "optimization/solver/util/Filter.hpp"
 #include "optimization/solver/util/FractionToTheBoundaryRule.hpp"
-#include "optimization/solver/util/IsLocallyInfeasible.hpp"
-#include "optimization/solver/util/KKTError.hpp"
+#include "optimization/solver/util/Bounds.hpp"
+#include "optimization/solver/util/ModifiedLagrangian.hpp"
+#include "optimization/solver/util/PrimalDualSystem.hpp"
+#include "optimization/solver/util/LogBarrierFunctions.hpp"
+#include "optimization/solver/util/SwitchingCriterion.hpp"
+#include "optimization/solver/util/TerminationCriteria.hpp"
 #include "sleipnir/autodiff/Gradient.hpp"
 #include "sleipnir/autodiff/Hessian.hpp"
 #include "sleipnir/autodiff/Jacobian.hpp"
 #include "sleipnir/optimization/SolverExitCondition.hpp"
 #include "sleipnir/util/Print.hpp"
+#include "sleipnir/util/EigenFormatter.hpp"
 #include "sleipnir/util/Spy.hpp"
-#include "sleipnir/util/small_vector.hpp"
 #include "util/ScopeExit.hpp"
 #include "util/ToMilliseconds.hpp"
 
@@ -35,128 +37,280 @@
 namespace sleipnir {
 
 void InteriorPoint(std::span<Variable> decisionVariables,
-                   std::span<Variable> equalityConstraints,
                    std::span<Variable> inequalityConstraints, Variable& f,
                    function_ref<bool(const SolverIterationInfo& info)> callback,
-                   const SolverConfig& config, bool feasibilityRestoration,
-                   Eigen::VectorXd& x, Eigen::VectorXd& s,
+                   const SolverConfig& config, Eigen::VectorXd& x,
                    SolverStatus* status) {
   const auto solveStartTime = std::chrono::system_clock::now();
 
-  // Map decision variables and constraints to VariableMatrices for Lagrangian
+  // Given in table 1 of [4]; explanations are included there.
+  static constexpr double ε_opt = 1e-6, ε_far = 1e-3, ε_inf = 1e-6,
+                          ε_unbd = 1e-12;
+  static_assert(0 < ε_opt);
+  static_assert(0 < ε_far && ε_far < 1);
+  static_assert(0 < ε_inf && ε_inf < 1);
+  static_assert(0 < ε_unbd && ε_unbd < 1);
+  static constexpr double β_1 = 1e-4, β_2 = 0.01, β_3 = 0.02, β_4 = 0.2,
+                          β_5 = 0x1p-5, β_6 = 0.5, β_7 = 0.5, β_8 = 0.9,
+                          β_10 = 1e-4, β_11 = 1e-2, β_12 = 1e3;
+  static_assert(0 < β_1 && β_1 < 1);
+  static_assert(0 < β_2 && β_2 < 1);
+  static_assert(β_2 < β_3 && β_3 < 1);
+  static_assert(0 < β_4 && β_4 < 1);
+  static_assert(0 < β_5 && β_5 < 1);
+  static_assert(0 < β_6 && β_6 < 1);
+  static_assert(0 < β_7 && β_7 < 1);
+  static_assert(0.5 < β_8 && β_8 < 1);
+  static_assert(0 < β_10 && β_10 < 1);
+  static_assert(0 < β_11);
+  static_assert(β_11 <= β_12);
+
+  // Map decision variables and constraints to VariableMatrices so that we can
+  // compute the gradient of the constraints and the Hessian of the modified
+  // Lagrangian wrt these variables.
   VariableMatrix xAD{decisionVariables};
-  xAD.SetValue(x);
-  VariableMatrix c_eAD{equalityConstraints};
   VariableMatrix c_iAD{inequalityConstraints};
+  Eigen::VectorXd c_i{inequalityConstraints.size()};
 
-  // Create autodiff variables for s, y, and z for Lagrangian
-  VariableMatrix sAD(inequalityConstraints.size());
-  sAD.SetValue(s);
-  VariableMatrix yAD(equalityConstraints.size());
-  for (auto& y : yAD) {
-    y.SetValue(0.0);
-  }
-  VariableMatrix zAD(inequalityConstraints.size());
-  for (auto& z : zAD) {
-    z.SetValue(1.0);
-  }
+  // Make new Variables for the Lagrange multipliers so that we can update them
+  // when we need to re-compute the Hessian of the modified Lagrangian.
+  Assert(inequalityConstraints.size() <= std::numeric_limits<int>::max());
+  VariableMatrix yAD{static_cast<int>(inequalityConstraints.size())};
+  // Make a new variable for μ so that we can update it before re-computing the
+  // Hessian of the modified Lagrangian.
+  Variable μAD;
 
-  // Lagrangian L
+  // Modified Lagrangian, L_μₖ; we only compute the Hessian from
+  // this.
   //
-  // L(xₖ, sₖ, yₖ, zₖ) = f(xₖ) − yₖᵀcₑ(xₖ) − zₖᵀ(cᵢ(xₖ) − sₖ)
-  auto L = f - (yAD.T() * c_eAD)(0) - (zAD.T() * (c_iAD - sAD))(0);
-
-  // Equality constraint Jacobian Aₑ
+  // L_μₖ = f(xₖ) + (yₖ - μₖβ₁e)ᵀcᵢ(xₖ),
+  Variable L = AutodiffModifiedLagrangian(f, yAD, c_iAD, μAD, β_1);
+  // Hessian of the modified Lagrangian H
   //
-  //         [∇ᵀcₑ₁(xₖ)]
-  // Aₑ(x) = [∇ᵀcₑ₂(xₖ)]
-  //         [    ⋮    ]
-  //         [∇ᵀcₑₘ(xₖ)]
-  Jacobian jacobianCe{c_eAD, xAD};
-  Eigen::SparseMatrix<double> A_e = jacobianCe.Value();
+  // Hₖ = ∇²ₓₓL_μₖ(xₖ, yₖ)
+  Hessian hessianL{L, xAD};
+  // First calculation should happen after we project x₀ onto bounds and first
+  // compute μ and set μAD during initialization.
+  Eigen::SparseMatrix<double> H;
 
-  // Inequality constraint Jacobian Aᵢ
+  // Gradient of f, denoted ∇f in the paper and g in the code
+  Gradient gradientF{f, xAD};
+  // First calculation should happen after we project x₀ onto bounds.
+  Eigen::SparseVector<double> g;
+
+  // Jacobian product ∇cᵢᵀy, used to compute the Lagrangian and termination
+  // criteria while re-using other autodiff computations
+  Gradient gradientComplimentarity{c_iAD, yAD};
+  // Calculations happen on every inner iteration but the first (where we
+  // instead use the constraint Jacobian directly).
+  Eigen::SparseVector<double> gradientComplimentarityValue;
+  // Jacobian product ∇cᵢᵀe, used to compute some termination criteria while
+  // re-using other necessary autodiff computations
+  Gradient gradientConstraintSum{c_iAD, VariableMatrix::Ones(c_iAD.size(), 1)};
+  // Calculations happen on every inner iteration but the first (where we
+  // instead use the constraint Jacobian directly).
+  Eigen::SparseVector<double> gradientConstraintSumValue;
+
+  // Inequality constraint Jacobian, Aᵢ
   //
-  //         [∇ᵀcᵢ₁(xₖ)]
-  // Aᵢ(x) = [∇ᵀcᵢ₂(xₖ)]
-  //         [    ⋮    ]
-  //         [∇ᵀcᵢₘ(xₖ)]
+  //          [∇ᵀcᵢ₁(xₖ)]
+  // Aᵢ(xₖ) = [∇ᵀcᵢ₂(xₖ)]
+  //          [    ⋮    ]
+  //          [∇ᵀcᵢₘ(xₖ)]
   Jacobian jacobianCi{c_iAD, xAD};
+  // We need this to detect bounds in the first place, so we compute it now and
+  // re-compute it after projecting x₀ onto bounds.
   Eigen::SparseMatrix<double> A_i = jacobianCi.Value();
 
-  // Gradient of f ∇f
-  Gradient gradientF{f, xAD};
-  Eigen::SparseVector<double> g = gradientF.Value();
+  // KKT system solver and the LHS matrix we pass to it
+  RegularizedLDLT solver;
+  Eigen::SparseMatrix<double> M;
 
-  // Hessian of the Lagrangian H
-  //
-  // Hₖ = ∇²ₓₓL(xₖ, sₖ, yₖ, zₖ)
-  Hessian hessianL{L, xAD};
-  Eigen::SparseMatrix<double> H = hessianL.Value();
-
-  Eigen::VectorXd y = yAD.Value();
-  Eigen::VectorXd z = zAD.Value();
-  Eigen::VectorXd c_e = c_eAD.Value();
-  Eigen::VectorXd c_i = c_iAD.Value();
-
-  // Check for overconstrained problem
-  if (equalityConstraints.size() > decisionVariables.size()) {
-    if (config.diagnostics) {
-      sleipnir::println("The problem has too few degrees of freedom.");
-      sleipnir::println(
-          "Violated constraints (cₑ(x) = 0) in order of declaration:");
-      for (int row = 0; row < c_e.rows(); ++row) {
-        if (c_e(row) < 0.0) {
-          sleipnir::println("  {}/{}: {} = 0", row + 1, c_e.rows(), c_e(row));
+  // Update x₀ and compute y₀, s₀, w, and μ₀ according to section
+  // B.2 of [4].
+  Eigen::VectorXd y{inequalityConstraints.size()};
+  Eigen::VectorXd s{inequalityConstraints.size()};
+  Eigen::VectorXd w{inequalityConstraints.size()};
+  double μ;
+  {
+    // Detect bounds by inspecting the inequality constraint Jacobian
+    const auto [boundConstraintMask, bounds, conflictingConstraints] =
+        GetBounds(decisionVariables, inequalityConstraints, A_i);
+    if (!conflictingConstraints.empty()) {
+      if (config.diagnostics) {
+        sleipnir::println(
+            "The problem is infeasible because of conflicting bound "
+            "constraints (conflicting indices are in order of inequality "
+            "constraint declaration and then equality constraint "
+            "declaration):");
+        for (const auto& [firstIndex, secondIndex] : conflictingConstraints) {
+          sleipnir::println("  Constraint {} conflicts with {}", firstIndex,
+                            secondIndex);
+        }
+        sleipnir::println(
+            "\nThe following bounds conflict (decision variable indices are in "
+            "order of declaration):");
+        for (std::size_t decisionVariableIndex = 0;
+             decisionVariableIndex < bounds.size(); decisionVariableIndex++) {
+          const auto& [lower, upper] = bounds[decisionVariableIndex];
+          if (lower > upper) {
+            sleipnir::println(
+                "  Decision variable {} has lower bound of {} which is greater "
+                "than its upper bound of {}",
+                decisionVariableIndex, lower, upper);
+          }
         }
       }
+      status->exitCondition = SolverExitCondition::kTooFewDOFs;
+      return;
     }
 
-    status->exitCondition = SolverExitCondition::kTooFewDOFs;
-    return;
+    // Project x₀ onto the bounds (should the user be able to disable this?).
+    Eigen::VectorXd xOld = x;
+    ProjectOntoBounds(x, bounds);
+
+    // Compute cᵢ(x₀ᵇ) and ∇f(x₀ᵇ) for the updated (bound-projected) x₀ᵇ,
+    // falling back to the user-provided x₀ if the objective or constraints are
+    // non-finite for the bound-projected x₀ᵇ.
+    auto UpdateXRecomputeAutodiff = [&xAD, &x, &f, &g, &gradientF, &c_i, &c_iAD,
+                                     &A_i,
+                                     &jacobianCi](const Eigen::VectorXd& newX) {
+      x = newX;
+      xAD.SetValue(x);
+      g = gradientF.Value();
+      c_i = c_iAD.Value();
+      A_i = jacobianCi.Value();
+      return std::isfinite(f.Value()) && c_i.allFinite();
+    };
+    if (!UpdateXRecomputeAutodiff(x) && !UpdateXRecomputeAutodiff(xOld)) {
+      status->exitCondition =
+          SolverExitCondition::kNonfiniteInitialCostOrConstraints;
+      return;
+    }
+
+    // This section is loosely based on Gertz, Nocedal, and Wright's init
+    // strategy for IPMs for NLP, given in algorithm 3.1 of [5].
+    //
+    // First compute provisional ỹ and s̃, which we use to
+    // form M (with H and Aᵢ, which were computed above).
+    Eigen::VectorXd yTilde =
+        Eigen::VectorXd::Ones(inequalityConstraints.size());
+    // Assumes cᵢ(x) ≤ 0. The paper writes this as:
+    //   −cᵢ(x₀) + max{−2minⱼ{sⱼ}, β₁₀},
+    // and is ambiguous about what s should be here. According to
+    // https://github.com/ohinder/OnePhase.jl/blob/4863f8146f1454c353118b3f12b1784dfea60032/src/init/gertz_init.jl#L12-L16
+    // we should use s = -cᵢ(x₀) (note the sign flip, since we assume cᵢ(x) ≤ 0
+    // following their paper, but their code assumes the opposite).
+    double μHat = std::max(2 * c_i.maxCoeff(), β_10);
+    μAD.SetValue(μHat);    // So that μ = μ̂ when computing the value of H
+    yAD.SetValue(yTilde);  // So that y = ỹ = e when computing the value of H
+    Eigen::VectorXd sTilde = -c_i.array() + μHat;
+    ComputePrimalDualLHS(M, hessianL, A_i, yTilde, sTilde);
+    solver.Compute(M);
+
+    // Compute an affine scaling step and use it to compute a more accurate
+    // estimate of yTilde.
+    // Again, the paper is ambiguous about the values of μ, γ, and w; inspecting
+    // https://github.com/ohinder/OnePhase.jl/blob/4863f8146f1454c353118b3f12b1784dfea60032/src/init/gertz_init.jl#L17
+    // and looking at [5] shows that we're supposed to compute an affine scaling
+    // step (i.e., γ = 0). Their code sets w to e, which is not like in [5]
+    // where they (in our notation) set w = −cᵢ(x) − δ.
+    const auto [_, d_y] =
+        PrimalDualStep(solver, g, yTilde, yTilde, sTilde, sTilde,
+                       Eigen::VectorXd::Ones(w.size()), A_i, A_i, μHat, 0, β_1);
+
+    // This section is based on Mehrotra's init strategy for an LP IPM, given in
+    // section 7 of [6].
+    static constexpr double negativeScaling =
+        2.0;  // Set to 1.5 in [6]; unclear why it's different in [4].
+    // Refine the intermediate estimate yTilde based on the above affine scaling
+    // step, and then find ε_y so that it is the smallest (times
+    // negativeScaling) elementwise increment that makes ỹ positive elementwise.
+    yTilde += d_y;
+    double ε_y = std::max(-negativeScaling * yTilde.minCoeff(), 0.0);
+    yTilde.array() += ε_y;
+
+    // Re-compute the intermediate estimate sTilde so that it isn't negative by
+    // adding the smallest elementwise increment (times negativeScaling) that
+    // makes s̃ positive.
+    sTilde = -c_i;
+    // The expression in [4] for ε_s seems to be wrong: 1) they take the max
+    // with the scaled Lagrangian instead of with 0, which doesn't match [6] and
+    // which makes less sense to me; 2) they write an L₂ norm instead of an L_∞
+    // norm of ỹ, which makes less sense (with the L_∞ norm this expression is
+    // like one of the termination criteria) and is not consistent with their
+    // code. 3) They compute ε_s after updating ỹ  with ε_y in [4], but in their
+    // code they compute ε_s before updating ỹ; the former is closer to what
+    // happens in [6] and seems to make a little more sense (since the updated ỹ
+    // might as well be taken into account).
+    double ε_s = std::max(-negativeScaling * sTilde.minCoeff(), 0.0) +
+                 ManualGradientModifiedLagrangian(g, A_i, yTilde, 0, β_1)
+                         .lpNorm<Eigen::Infinity>() /
+                     (yTilde.lpNorm<Eigen::Infinity>() + 1.0);
+    sTilde += ε_s * boundConstraintMask;
+
+    // Compute the final refinement of yTilde and sTilde based on the weighted
+    // mean complimentarity.
+    auto WeightedMeanComp = [](const Eigen::VectorXd& sTilde,
+                               const Eigen::VectorXd& yTilde,
+                               const Eigen::VectorXd& weight) -> double {
+      return sTilde.dot(yTilde) / (2 * weight.sum());
+    };
+    // All ops here are componentwise, so aliasing shouldn't be an issue
+    yTilde = (yTilde.array() + WeightedMeanComp(sTilde, yTilde, sTilde))
+                 .min(β_12)
+                 .max(β_11);
+    sTilde += boundConstraintMask * WeightedMeanComp(sTilde, yTilde, yTilde);
+    double μTilde = sTilde.cwiseProduct(yTilde).mean();
+
+    // Set final output values.
+    if (config.diagnostics) {
+      sleipnir::println("Barrier initial guess scale: {}",
+                        config.initialBarrierScale);
+    }
+    μ = config.initialBarrierScale * μTilde;
+    s = sTilde;
+    w = (c_i + s) / μ;
+    y = yTilde.cwiseMax(β_3 * μ * s.cwiseInverse())
+            .cwiseMin((1 / β_3) * μ * s.cwiseInverse());
   }
 
-  // Check whether initial guess has finite f(xₖ), cₑ(xₖ), and cᵢ(xₖ)
-  if (!std::isfinite(f.Value()) || !c_e.allFinite() || !c_i.allFinite()) {
-    status->exitCondition =
-        SolverExitCondition::kNonfiniteInitialCostOrConstraints;
-    return;
+  if (config.diagnostics) {
+    sleipnir::println("Error tolerance: {}\n", config.tolerance);
   }
 
   // Sparsity pattern files written when spy flag is set in SolverConfig
   std::ofstream H_spy;
-  std::ofstream A_e_spy;
   std::ofstream A_i_spy;
   if (config.spy) {
-    A_e_spy.open("A_e.spy");
-    A_i_spy.open("A_i.spy");
     H_spy.open("H.spy");
+    A_i_spy.open("A_i.spy");
   }
 
-  if (config.diagnostics && !feasibilityRestoration) {
-    sleipnir::println("Error tolerance: {}\n", config.tolerance);
-  }
-
-  std::chrono::system_clock::time_point iterationsStartTime;
-
+  // We count total iterations to check the max iteration exit condition, and
+  // acceptable iterations to check the acceptable tolerance exit condition.
   int iterations = 0;
+  int acceptableIterCounter = 0;
 
-  // Prints final diagnostics when the solver exits
+  // Prints final diagnostics when the solver exits.
+  std::chrono::system_clock::time_point allIterationsStartTime;
   scope_exit exit{[&] {
     status->cost = f.Value();
 
-    if (config.diagnostics && !feasibilityRestoration) {
+    if (config.diagnostics) {
       auto solveEndTime = std::chrono::system_clock::now();
 
       sleipnir::println("\nSolve time: {:.3f} ms",
                         ToMilliseconds(solveEndTime - solveStartTime));
-      sleipnir::println("  ↳ {:.3f} ms (solver setup)",
-                        ToMilliseconds(iterationsStartTime - solveStartTime));
+      sleipnir::println(
+          "  ↳ {:.3f} ms (solver setup)",
+          ToMilliseconds(allIterationsStartTime - solveStartTime));
       if (iterations > 0) {
         sleipnir::println(
             "  ↳ {:.3f} ms ({} solver iterations; {:.3f} ms average)",
-            ToMilliseconds(solveEndTime - iterationsStartTime), iterations,
-            ToMilliseconds((solveEndTime - iterationsStartTime) / iterations));
+            ToMilliseconds(solveEndTime - allIterationsStartTime), iterations,
+            ToMilliseconds((solveEndTime - allIterationsStartTime) /
+                           iterations));
       }
       sleipnir::println("");
 
@@ -171,10 +325,6 @@ void InteriorPoint(std::span<Variable> decisionVariables,
       sleipnir::println(format, "∇²ₓₓL", hessianL.GetProfiler().SetupDuration(),
                         hessianL.GetProfiler().AverageSolveDuration(),
                         hessianL.GetProfiler().SolveMeasurements());
-      sleipnir::println(format, "∂cₑ/∂x",
-                        jacobianCe.GetProfiler().SetupDuration(),
-                        jacobianCe.GetProfiler().AverageSolveDuration(),
-                        jacobianCe.GetProfiler().SolveMeasurements());
       sleipnir::println(format, "∂cᵢ/∂x",
                         jacobianCi.GetProfiler().SetupDuration(),
                         jacobianCi.GetProfiler().AverageSolveDuration(),
@@ -183,622 +333,17 @@ void InteriorPoint(std::span<Variable> decisionVariables,
     }
   }};
 
-  // Barrier parameter minimum
-  const double μ_min = config.tolerance / 10.0;
-
-  // Barrier parameter μ
-  double μ = 0.1;
-
-  // Fraction-to-the-boundary rule scale factor minimum
-  constexpr double τ_min = 0.99;
-
-  // Fraction-to-the-boundary rule scale factor τ
-  double τ = τ_min;
-
-  Filter filter{f, μ};
-
-  // This should be run when the error estimate is below a desired threshold for
-  // the current barrier parameter
-  auto UpdateBarrierParameterAndResetFilter = [&] {
-    // Barrier parameter linear decrease power in "κ_μ μ". Range of (0, 1).
-    constexpr double κ_μ = 0.2;
-
-    // Barrier parameter superlinear decrease power in "μ^(θ_μ)". Range of (1,
-    // 2).
-    constexpr double θ_μ = 1.5;
-
-    // Update the barrier parameter.
-    //
-    //   μⱼ₊₁ = max(εₜₒₗ/10, min(κ_μ μⱼ, μⱼ^θ_μ))
-    //
-    // See equation (7) of [2].
-    μ = std::max(μ_min, std::min(κ_μ * μ, std::pow(μ, θ_μ)));
-
-    // Update the fraction-to-the-boundary rule scaling factor.
-    //
-    //   τⱼ = max(τₘᵢₙ, 1 − μⱼ)
-    //
-    // See equation (8) of [2].
-    τ = std::max(τ_min, 1.0 - μ);
-
-    // Reset the filter when the barrier parameter is updated
-    filter.Reset(μ);
-  };
-
-  // Kept outside the loop so its storage can be reused
-  small_vector<Eigen::Triplet<double>> triplets;
-
-  RegularizedLDLT solver;
-
-  // Variables for determining when a step is acceptable
-  constexpr double α_red_factor = 0.5;
-  int acceptableIterCounter = 0;
-
-  int fullStepRejectedCounter = 0;
-  int stepTooSmallCounter = 0;
-
-  // Error estimate
-  double E_0 = std::numeric_limits<double>::infinity();
-
   if (config.diagnostics) {
-    iterationsStartTime = std::chrono::system_clock::now();
+    allIterationsStartTime = std::chrono::system_clock::now();
   }
-
-  while (E_0 > config.tolerance &&
-         acceptableIterCounter < config.maxAcceptableIterations) {
-    std::chrono::system_clock::time_point innerIterStartTime;
+  // TODO(declan): Max acceptable iterations is BROKEN because we don't check
+  // error tolerance here... Is it even appropriate to continue to track this?
+  // What error tolerance would we track?
+  while (acceptableIterCounter < config.maxAcceptableIterations) {
+    std::chrono::system_clock::time_point outerIterStartTime;
     if (config.diagnostics) {
-      innerIterStartTime = std::chrono::system_clock::now();
+      outerIterStartTime = std::chrono::system_clock::now();
     }
-
-    // Check for local equality constraint infeasibility
-    if (IsEqualityLocallyInfeasible(A_e, c_e)) {
-      if (config.diagnostics) {
-        sleipnir::println(
-            "The problem is locally infeasible due to violated equality "
-            "constraints.");
-        sleipnir::println(
-            "Violated constraints (cₑ(x) = 0) in order of declaration:");
-        for (int row = 0; row < c_e.rows(); ++row) {
-          if (c_e(row) < 0.0) {
-            sleipnir::println("  {}/{}: {} = 0", row + 1, c_e.rows(), c_e(row));
-          }
-        }
-      }
-
-      status->exitCondition = SolverExitCondition::kLocallyInfeasible;
-      return;
-    }
-
-    // Check for local inequality constraint infeasibility
-    if (IsInequalityLocallyInfeasible(A_i, c_i)) {
-      if (config.diagnostics) {
-        sleipnir::println(
-            "The problem is infeasible due to violated inequality "
-            "constraints.");
-        sleipnir::println(
-            "Violated constraints (cᵢ(x) ≥ 0) in order of declaration:");
-        for (int row = 0; row < c_i.rows(); ++row) {
-          if (c_i(row) < 0.0) {
-            sleipnir::println("  {}/{}: {} ≥ 0", row + 1, c_i.rows(), c_i(row));
-          }
-        }
-      }
-
-      status->exitCondition = SolverExitCondition::kLocallyInfeasible;
-      return;
-    }
-
-    // Check for diverging iterates
-    if (x.lpNorm<Eigen::Infinity>() > 1e20 || !x.allFinite() ||
-        s.lpNorm<Eigen::Infinity>() > 1e20 || !s.allFinite()) {
-      status->exitCondition = SolverExitCondition::kDivergingIterates;
-      return;
-    }
-
-    // Write out spy file contents if that's enabled
-    if (config.spy) {
-      // Gap between sparsity patterns
-      if (iterations > 0) {
-        A_e_spy << "\n";
-        A_i_spy << "\n";
-        H_spy << "\n";
-      }
-
-      Spy(H_spy, H);
-      Spy(A_e_spy, A_e);
-      Spy(A_i_spy, A_i);
-    }
-
-    // Call user callback
-    if (callback({iterations, x, s, g, H, A_i})) {
-      status->exitCondition = SolverExitCondition::kCallbackRequestedStop;
-      return;
-    }
-
-    //     [s₁ 0 ⋯ 0 ]
-    // S = [0  ⋱   ⋮ ]
-    //     [⋮    ⋱ 0 ]
-    //     [0  ⋯ 0 sₘ]
-    const auto S = s.asDiagonal();
-    Eigen::SparseMatrix<double> Sinv;
-    Sinv = s.cwiseInverse().asDiagonal();
-
-    //     [z₁ 0 ⋯ 0 ]
-    // Z = [0  ⋱   ⋮ ]
-    //     [⋮    ⋱ 0 ]
-    //     [0  ⋯ 0 zₘ]
-    const auto Z = z.asDiagonal();
-    Eigen::SparseMatrix<double> Zinv;
-    Zinv = z.cwiseInverse().asDiagonal();
-
-    // Σ = S⁻¹Z
-    const Eigen::SparseMatrix<double> Σ = Sinv * Z;
-
-    // lhs = [H + AᵢᵀΣAᵢ  Aₑᵀ]
-    //       [    Aₑ       0 ]
-    //
-    // Don't assign upper triangle because solver only uses lower triangle.
-    const Eigen::SparseMatrix<double> topLeft =
-        H.triangularView<Eigen::Lower>() +
-        (A_i.transpose() * Σ * A_i).triangularView<Eigen::Lower>();
-    triplets.clear();
-    triplets.reserve(topLeft.nonZeros() + A_e.nonZeros());
-    for (int col = 0; col < H.cols(); ++col) {
-      // Append column of H + AᵢᵀΣAᵢ lower triangle in top-left quadrant
-      for (Eigen::SparseMatrix<double>::InnerIterator it{topLeft, col}; it;
-           ++it) {
-        triplets.emplace_back(it.row(), it.col(), it.value());
-      }
-      // Append column of Aₑ in bottom-left quadrant
-      for (Eigen::SparseMatrix<double>::InnerIterator it{A_e, col}; it; ++it) {
-        triplets.emplace_back(H.rows() + it.row(), it.col(), it.value());
-      }
-    }
-    Eigen::SparseMatrix<double> lhs(
-        decisionVariables.size() + equalityConstraints.size(),
-        decisionVariables.size() + equalityConstraints.size());
-    lhs.setFromSortedTriplets(triplets.begin(), triplets.end(),
-                              [](const auto&, const auto& b) { return b; });
-
-    const Eigen::VectorXd e = Eigen::VectorXd::Ones(s.rows());
-
-    // rhs = −[∇f − Aₑᵀy + Aᵢᵀ(S⁻¹(Zcᵢ − μe) − z)]
-    //        [                cₑ                ]
-    Eigen::VectorXd rhs{x.rows() + y.rows()};
-    rhs.segment(0, x.rows()) =
-        -(g - A_e.transpose() * y +
-          A_i.transpose() * (Sinv * (Z * c_i - μ * e) - z));
-    rhs.segment(x.rows(), y.rows()) = -c_e;
-
-    // Solve the Newton-KKT system
-    // solver.Compute(lhs, equalityConstraints.size(), μ);
-    Eigen::VectorXd step{x.rows() + y.rows()};
-    if (solver.Info() == Eigen::Success) {
-      step = solver.Solve(rhs);
-    } else {
-      // The regularization procedure failed due to a rank-deficient equality
-      // constraint Jacobian with linearly dependent constraints. Set the step
-      // length to zero and let second-order corrections attempt to restore
-      // feasibility.
-      step.setZero();
-    }
-
-    // step = [ pₖˣ]
-    //        [−pₖʸ]
-    Eigen::VectorXd p_x = step.segment(0, x.rows());
-    Eigen::VectorXd p_y = -step.segment(x.rows(), y.rows());
-
-    // pₖᶻ = −Σcᵢ + μS⁻¹e − ΣAᵢpₖˣ
-    Eigen::VectorXd p_z = -Σ * c_i + μ * Sinv * e - Σ * A_i * p_x;
-
-    // pₖˢ = μZ⁻¹e − s − Z⁻¹Spₖᶻ
-    Eigen::VectorXd p_s = μ * Zinv * e - s - Zinv * S * p_z;
-
-    // αᵐᵃˣ = max(α ∈ (0, 1] : sₖ + αpₖˢ ≥ (1−τⱼ)sₖ)
-    const double α_max = FractionToTheBoundaryRule(s, p_s, τ);
-    double α = α_max;
-
-    // αₖᶻ = max(α ∈ (0, 1] : zₖ + αpₖᶻ ≥ (1−τⱼ)zₖ)
-    double α_z = FractionToTheBoundaryRule(z, p_z, τ);
-
-    // Loop until a step is accepted. If a step becomes acceptable, the loop
-    // will exit early.
-    while (1) {
-      Eigen::VectorXd trial_x = x + α * p_x;
-      Eigen::VectorXd trial_y = y + α_z * p_y;
-      Eigen::VectorXd trial_z = z + α_z * p_z;
-
-      xAD.SetValue(trial_x);
-
-      Eigen::VectorXd trial_c_e = c_eAD.Value();
-      Eigen::VectorXd trial_c_i = c_iAD.Value();
-
-      // If f(xₖ + αpₖˣ), cₑ(xₖ + αpₖˣ), or cᵢ(xₖ + αpₖˣ) aren't finite, reduce
-      // step size immediately
-      if (!std::isfinite(f.Value()) || !trial_c_e.allFinite() ||
-          !trial_c_i.allFinite()) {
-        // Reduce step size
-        α *= α_red_factor;
-        continue;
-      }
-
-      Eigen::VectorXd trial_s;
-      if (config.feasibleIPM && c_i.cwiseGreater(0.0).all()) {
-        // If the inequality constraints are all feasible, prevent them from
-        // becoming infeasible again.
-        //
-        // See equation (19.30) in [1].
-        trial_s = trial_c_i;
-      } else {
-        trial_s = s + α * p_s;
-      }
-
-      // Check whether filter accepts trial iterate
-      auto entry = filter.MakeEntry(trial_s, trial_c_e, trial_c_i);
-      if (filter.TryAdd(entry)) {
-        // Accept step
-        break;
-      }
-
-      double prevConstraintViolation = c_e.lpNorm<1>() + (c_i - s).lpNorm<1>();
-      double nextConstraintViolation =
-          trial_c_e.lpNorm<1>() + (trial_c_i - trial_s).lpNorm<1>();
-
-      // Second-order corrections
-      //
-      // If first trial point was rejected and constraint violation stayed the
-      // same or went up, apply second-order corrections
-      if (nextConstraintViolation >= prevConstraintViolation) {
-        // Apply second-order corrections. See section 2.4 of [2].
-        Eigen::VectorXd p_x_cor = p_x;
-        Eigen::VectorXd p_y_soc = p_y;
-        Eigen::VectorXd p_z_soc = p_z;
-        Eigen::VectorXd p_s_soc = p_s;
-
-        double α_soc = α;
-        Eigen::VectorXd c_e_soc = c_e;
-
-        bool stepAcceptable = false;
-        for (int soc_iteration = 0; soc_iteration < 5 && !stepAcceptable;
-             ++soc_iteration) {
-          // Rebuild Newton-KKT rhs with updated constraint values.
-          //
-          // rhs = −[∇f − Aₑᵀy + Aᵢᵀ(S⁻¹(Zcᵢ − μe) − z)]
-          //        [              cₑˢᵒᶜ               ]
-          //
-          // where cₑˢᵒᶜ = αc(xₖ) + c(xₖ + αpₖˣ)
-          c_e_soc = α_soc * c_e_soc + trial_c_e;
-          rhs.bottomRows(y.rows()) = -c_e_soc;
-
-          // Solve the Newton-KKT system
-          step = solver.Solve(rhs);
-
-          p_x_cor = step.segment(0, x.rows());
-          p_y_soc = -step.segment(x.rows(), y.rows());
-
-          // pₖᶻ = −Σcᵢ + μS⁻¹e − ΣAᵢpₖˣ
-          p_z_soc = -Σ * c_i + μ * Sinv * e - Σ * A_i * p_x_cor;
-
-          // pₖˢ = μZ⁻¹e − s − Z⁻¹Spₖᶻ
-          p_s_soc = μ * Zinv * e - s - Zinv * S * p_z_soc;
-
-          // αˢᵒᶜ = max(α ∈ (0, 1] : sₖ + αpₖˢ ≥ (1−τⱼ)sₖ)
-          α_soc = FractionToTheBoundaryRule(s, p_s_soc, τ);
-          trial_x = x + α_soc * p_x_cor;
-          trial_s = s + α_soc * p_s_soc;
-
-          // αₖᶻ = max(α ∈ (0, 1] : zₖ + αpₖᶻ ≥ (1−τⱼ)zₖ)
-          double α_z_soc = FractionToTheBoundaryRule(z, p_z_soc, τ);
-          trial_y = y + α_z_soc * p_y_soc;
-          trial_z = z + α_z_soc * p_z_soc;
-
-          xAD.SetValue(trial_x);
-
-          trial_c_e = c_eAD.Value();
-          trial_c_i = c_iAD.Value();
-
-          // Check whether filter accepts trial iterate
-          entry = filter.MakeEntry(trial_s, trial_c_e, trial_c_i);
-          if (filter.TryAdd(entry)) {
-            p_x = p_x_cor;
-            p_y = p_y_soc;
-            p_z = p_z_soc;
-            p_s = p_s_soc;
-            α = α_soc;
-            α_z = α_z_soc;
-            stepAcceptable = true;
-          }
-        }
-
-        if (stepAcceptable) {
-          // Accept step
-          break;
-        }
-      }
-
-      // If we got here and α is the full step, the full step was rejected.
-      // Increment the full-step rejected counter to keep track of how many full
-      // steps have been rejected in a row.
-      if (α == α_max) {
-        ++fullStepRejectedCounter;
-      }
-
-      // If the full step was rejected enough times in a row, reset the filter
-      // because it may be impeding progress.
-      //
-      // See section 3.2 case I of [2].
-      if (fullStepRejectedCounter >= 4 &&
-          filter.maxConstraintViolation > entry.constraintViolation / 10.0) {
-        filter.maxConstraintViolation *= 0.1;
-        filter.Reset(μ);
-        continue;
-      }
-
-      // Reduce step size
-      α *= α_red_factor;
-
-      // Safety factor for the minimal step size
-      constexpr double α_min_frac = 0.05;
-
-      // If step size hit a minimum, check if the KKT error was reduced. If it
-      // wasn't, invoke feasibility restoration.
-      if (α < α_min_frac * Filter::γConstraint) {
-        double currentKKTError = KKTError(g, A_e, c_e, A_i, c_i, s, y, z, μ);
-
-        Eigen::VectorXd trial_x = x + α_max * p_x;
-        Eigen::VectorXd trial_s = s + α_max * p_s;
-
-        Eigen::VectorXd trial_y = y + α_z * p_y;
-        Eigen::VectorXd trial_z = z + α_z * p_z;
-
-        // Upate autodiff
-        xAD.SetValue(trial_x);
-        sAD.SetValue(trial_s);
-        yAD.SetValue(trial_y);
-        zAD.SetValue(trial_z);
-
-        Eigen::VectorXd trial_c_e = c_eAD.Value();
-        Eigen::VectorXd trial_c_i = c_iAD.Value();
-
-        double nextKKTError = KKTError(gradientF.Value(), jacobianCe.Value(),
-                                       trial_c_e, jacobianCi.Value(), trial_c_i,
-                                       trial_s, trial_y, trial_z, μ);
-
-        // If the step using αᵐᵃˣ reduced the KKT error, accept it anyway
-        if (nextKKTError <= 0.999 * currentKKTError) {
-          α = α_max;
-
-          // Accept step
-          break;
-        }
-
-        // If the step direction was bad and feasibility restoration is
-        // already running, running it again won't help
-        if (feasibilityRestoration) {
-          status->exitCondition = SolverExitCondition::kLocallyInfeasible;
-          return;
-        }
-
-        auto initialEntry = filter.MakeEntry(s, c_e, c_i);
-
-        // Feasibility restoration phase
-        Eigen::VectorXd fr_x = x;
-        Eigen::VectorXd fr_s = s;
-        SolverStatus fr_status;
-        FeasibilityRestoration(
-            decisionVariables, equalityConstraints, inequalityConstraints, μ,
-            [&](const SolverIterationInfo& info) {
-              Eigen::VectorXd trial_x =
-                  info.x.segment(0, decisionVariables.size());
-              xAD.SetValue(trial_x);
-
-              Eigen::VectorXd trial_s =
-                  info.s.segment(0, inequalityConstraints.size());
-              sAD.SetValue(trial_s);
-
-              Eigen::VectorXd trial_c_e = c_eAD.Value();
-              Eigen::VectorXd trial_c_i = c_iAD.Value();
-
-              // If current iterate is acceptable to normal filter and
-              // constraint violation has sufficiently reduced, stop
-              // feasibility restoration
-              auto entry = filter.MakeEntry(trial_s, trial_c_e, trial_c_i);
-              if (filter.IsAcceptable(entry) &&
-                  entry.constraintViolation <
-                      0.9 * initialEntry.constraintViolation) {
-                return true;
-              }
-
-              return false;
-            },
-            config, fr_x, fr_s, &fr_status);
-
-        if (fr_status.exitCondition ==
-            SolverExitCondition::kCallbackRequestedStop) {
-          p_x = fr_x - x;
-          p_s = fr_s - s;
-
-          // Lagrange mutliplier estimates
-          //
-          //   [y] = (ÂÂᵀ)⁻¹Â[ ∇f]
-          //   [z]           [−μe]
-          //
-          //   where Â = [Aₑ   0]
-          //             [Aᵢ  −S]
-          //
-          // See equation (19.37) of [1].
-          {
-            xAD.SetValue(fr_x);
-            sAD.SetValue(c_iAD.Value());
-
-            A_e = jacobianCe.Value();
-            A_i = jacobianCi.Value();
-            g = gradientF.Value();
-
-            // Â = [Aₑ   0]
-            //     [Aᵢ  −S]
-            triplets.clear();
-            triplets.reserve(A_e.nonZeros() + A_i.nonZeros() + s.rows());
-            for (int col = 0; col < A_e.cols(); ++col) {
-              // Append column of Aₑ in top-left quadrant
-              for (Eigen::SparseMatrix<double>::InnerIterator it{A_e, col}; it;
-                   ++it) {
-                triplets.emplace_back(it.row(), it.col(), it.value());
-              }
-              // Append column of Aᵢ in bottom-left quadrant
-              for (Eigen::SparseMatrix<double>::InnerIterator it{A_i, col}; it;
-                   ++it) {
-                triplets.emplace_back(A_e.rows() + it.row(), it.col(),
-                                      it.value());
-              }
-            }
-            // Append −S in bottom-right quadrant
-            for (int i = 0; i < s.rows(); ++i) {
-              triplets.emplace_back(A_e.rows() + i, A_e.cols() + i, -s(i));
-            }
-            Eigen::SparseMatrix<double> Ahat{A_e.rows() + A_i.rows(),
-                                             A_e.cols() + s.rows()};
-            Ahat.setFromSortedTriplets(
-                triplets.begin(), triplets.end(),
-                [](const auto&, const auto& b) { return b; });
-
-            // lhs = ÂÂᵀ
-            Eigen::SparseMatrix<double> lhs = Ahat * Ahat.transpose();
-
-            // rhs = Â[ ∇f]
-            //        [−μe]
-            Eigen::VectorXd rhsTemp{g.rows() + e.rows()};
-            rhsTemp.block(0, 0, g.rows(), 1) = g;
-            rhsTemp.block(g.rows(), 0, s.rows(), 1) = -μ * e;
-            Eigen::VectorXd rhs = Ahat * rhsTemp;
-
-            Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> yzEstimator{lhs};
-            Eigen::VectorXd sol = yzEstimator.solve(rhs);
-
-            p_y = y - sol.block(0, 0, y.rows(), 1);
-            p_z = z - sol.block(y.rows(), 0, z.rows(), 1);
-          }
-
-          α = 1.0;
-          α_z = 1.0;
-
-          // Accept step
-          break;
-        } else if (fr_status.exitCondition == SolverExitCondition::kSuccess) {
-          status->exitCondition = SolverExitCondition::kLocallyInfeasible;
-          x = fr_x;
-          return;
-        } else {
-          status->exitCondition =
-              SolverExitCondition::kFeasibilityRestorationFailed;
-          x = fr_x;
-          return;
-        }
-      }
-    }
-
-    // If full step was accepted, reset full-step rejected counter
-    if (α == α_max) {
-      fullStepRejectedCounter = 0;
-    }
-
-    // Handle very small search directions by letting αₖ = αₖᵐᵃˣ when
-    // max(|pₖˣ(i)|/(1 + |xₖ(i)|)) < 10ε_mach.
-    //
-    // See section 3.9 of [2].
-    double maxStepScaled = 0.0;
-    for (int row = 0; row < x.rows(); ++row) {
-      maxStepScaled = std::max(maxStepScaled,
-                               std::abs(p_x(row)) / (1.0 + std::abs(x(row))));
-    }
-    if (maxStepScaled < 10.0 * std::numeric_limits<double>::epsilon()) {
-      α = α_max;
-      ++stepTooSmallCounter;
-    } else {
-      stepTooSmallCounter = 0;
-    }
-
-    // xₖ₊₁ = xₖ + αₖpₖˣ
-    // sₖ₊₁ = sₖ + αₖpₖˢ
-    // yₖ₊₁ = yₖ + αₖᶻpₖʸ
-    // zₖ₊₁ = zₖ + αₖᶻpₖᶻ
-    x += α * p_x;
-    s += α * p_s;
-    y += α_z * p_y;
-    z += α_z * p_z;
-
-    // A requirement for the convergence proof is that the "primal-dual barrier
-    // term Hessian" Σₖ does not deviate arbitrarily much from the "primal
-    // Hessian" μⱼSₖ⁻². We ensure this by resetting
-    //
-    //   zₖ₊₁⁽ⁱ⁾ = max(min(zₖ₊₁⁽ⁱ⁾, κ_Σ μⱼ/sₖ₊₁⁽ⁱ⁾), μⱼ/(κ_Σ sₖ₊₁⁽ⁱ⁾))
-    //
-    // for some fixed κ_Σ ≥ 1 after each step. See equation (16) of [2].
-    {
-      // Barrier parameter scale factor for inequality constraint Lagrange
-      // multiplier safeguard
-      constexpr double κ_Σ = 1e10;
-
-      for (int row = 0; row < z.rows(); ++row) {
-        z(row) =
-            std::max(std::min(z(row), κ_Σ * μ / s(row)), μ / (κ_Σ * s(row)));
-      }
-    }
-
-    // Update autodiff for Jacobians and Hessian
-    xAD.SetValue(x);
-    sAD.SetValue(s);
-    yAD.SetValue(y);
-    zAD.SetValue(z);
-    A_e = jacobianCe.Value();
-    A_i = jacobianCi.Value();
-    g = gradientF.Value();
-    H = hessianL.Value();
-
-    c_e = c_eAD.Value();
-    c_i = c_iAD.Value();
-
-    // Update the error estimate
-    E_0 = ErrorEstimate(g, A_e, c_e, A_i, c_i, s, y, z, 0.0);
-    if (E_0 < config.acceptableTolerance) {
-      ++acceptableIterCounter;
-    } else {
-      acceptableIterCounter = 0;
-    }
-
-    // Update the barrier parameter if necessary
-    if (E_0 > config.tolerance) {
-      // Barrier parameter scale factor for tolerance checks
-      constexpr double κ_ε = 10.0;
-
-      // While the error estimate is below the desired threshold for this
-      // barrier parameter value, decrease the barrier parameter further
-      double E_μ = ErrorEstimate(g, A_e, c_e, A_i, c_i, s, y, z, μ);
-      while (μ > μ_min && E_μ <= κ_ε * μ) {
-        UpdateBarrierParameterAndResetFilter();
-        E_μ = ErrorEstimate(g, A_e, c_e, A_i, c_i, s, y, z, μ);
-      }
-    }
-
-    const auto innerIterEndTime = std::chrono::system_clock::now();
-
-    // Diagnostics for current iteration
-    if (config.diagnostics) {
-      if (iterations % 20 == 0) {
-        sleipnir::println("{:^4}   {:^9}  {:^13}  {:^13}  {:^13}", "iter",
-                          "time (ms)", "error", "cost", "infeasibility");
-        sleipnir::println("{:=^61}", "");
-      }
-
-      sleipnir::println("{:4}{}  {:9.3f}  {:13e}  {:13e}  {:13e}", iterations,
-                        feasibilityRestoration ? "r" : " ",
-                        ToMilliseconds(innerIterEndTime - innerIterStartTime),
-                        E_0, f.Value(),
-                        c_e.lpNorm<1>() + (c_i - s).lpNorm<1>());
-    }
-
-    ++iterations;
 
     // Check for max iterations
     if (iterations >= config.maxIterations) {
@@ -806,18 +351,194 @@ void InteriorPoint(std::span<Variable> decisionVariables,
       return;
     }
 
-    // Check for max wall clock time
-    if (innerIterEndTime - solveStartTime > config.timeout) {
-      status->exitCondition = SolverExitCondition::kTimeout;
+    // Check for solve to acceptable tolerance
+    // TODO(declan): Again, this is broken... Need to remind myself of IPOPT's
+    // rationale for this and determine whether or not we really need it with
+    // one-phase.
+    // if (E_0 > config.tolerance &&
+    //     acceptableIterCounter == config.maxAcceptableIterations) {
+    //   status->exitCondition =
+    //   SolverExitCondition::kSolvedToAcceptableTolerance; return;
+    // }
+
+    // Set autodiff variables to the current (outer iteration) state and perform
+    // both cheap (objective gradient) and expensive autodiff (constraint
+    // Jacobian and Lagrangian Hessian).
+    xAD.SetValue(x);
+    g = gradientF.Value();
+    c_i = c_iAD.Value();
+    A_i = jacobianCi.Value();
+    yAD.SetValue(y);
+    μAD.SetValue(μ);
+    H = hessianL.Value();
+
+    // Write out spy file contents if that's enabled
+    if (config.spy) {
+      // Gap between sparsity patterns
+      if (iterations > 0) {
+        A_i_spy << "\n";
+        H_spy << "\n";
+      }
+
+      Spy(A_i_spy, A_i);
+      Spy(H_spy, H);
+    }
+
+    // Form the Schur compliment of the block-eliminated primal-dual system
+    ComputePrimalDualLHS(M, hessianL, A_i, y, s);
+
+    // Find some δ s.t. M + δI > 0 and then perform a LDLᵀ factorization of δ
+    // XXX(declan): I think we handle δ differently on the first iteration than
+    // in the paper, which says to set δ ← 0; we're currently using whatever δ
+    // we had in init.
+    // TODO(declan): Need to incorparate step A.6 from Algorithm 4 in [4].
+    solver.Compute(M);
+
+    // We're done computing (potentially multiple) new iteration(s), so we call
+    // the user callback.
+    // TODO(declan): I'm not calling this for each inner iteration since we
+    // don't re-compute H or A_i for the inner iterations... Need to check how
+    // this callback is used in practice to determine whether changing the
+    // callback is appropriate. In some ways, the "inner iterations" thing is
+    // like a second-order correction, and I don't think the user cares about
+    // the intermediate updates of the second-order correction unless they all
+    // succeed?? Hm or maybe they do?
+    // XXX(declan): Previously this skipped the first iteration, I think?
+    if (callback({iterations, x, s, g, H, A_i})) {
+      status->exitCondition = SolverExitCondition::kCallbackRequestedStop;
       return;
     }
 
-    // Check for solve to acceptable tolerance
-    if (E_0 > config.tolerance &&
-        acceptableIterCounter == config.maxAcceptableIterations) {
-      status->exitCondition = SolverExitCondition::kSolvedToAcceptableTolerance;
-      return;
+    // Save the iterate we used to compute H and A_i
+    const double μHat = μ;
+    const Eigen::VectorXd xHat = x;
+    const Eigen::VectorXd sHat = s;
+    const Eigen::VectorXd yHat = y;
+
+    for (int innerIterCounter = 0; innerIterCounter < 2; innerIterCounter++) {
+      bool locallyOptimal, locallyInfeasible;
+      if (innerIterCounter == 0) {
+        // We've already computed the full constraint Jacobian in this case, so
+        // just taking the following matrix-vector products is cheaper than more
+        // autodiff
+        locallyOptimal = IsLocallyOptimal(y, s, c_i, g, A_i, β_1, ε_opt);
+        locallyInfeasible = IsInequalityLocallyInfeasible(
+            y, s, c_i, A_i.transpose() * y, ε_far, ε_inf);
+      } else {
+        // Update autodiff variables with new inner iteration state and perform
+        // *only* the cheap autodiff (which is what distinguishes this from an
+        // outer iteration).
+        xAD.SetValue(x);
+        c_i = c_iAD.Value();
+        g = gradientF.Value();
+        yAD.SetValue(x);
+        μAD.SetValue(μ);
+        gradientComplimentarityValue = gradientComplimentarity.Value();
+        gradientConstraintSumValue = gradientConstraintSum.Value();
+
+        locallyOptimal =
+            IsLocallyOptimal(y, s, c_i, g, gradientComplimentarityValue,
+                             gradientConstraintSumValue, ε_far, ε_inf);
+        locallyInfeasible = IsInequalityLocallyInfeasible(
+            y, s, c_i, gradientComplimentarityValue, ε_far, ε_inf);
+      }
+
+      // Check if the KKT conditions are satisfied to some accuracy.
+      if (locallyOptimal) {
+        status->exitCondition = SolverExitCondition::kSuccess;
+        return;
+      }
+
+      // Check for local inequality constraint infeasibility.
+      if (locallyInfeasible) {
+        if (config.diagnostics) {
+          sleipnir::println(
+              "The problem appears to be locally infeasible because it is "
+              "approaching a stationary point for a weighted L_∞ infeasibility "
+              "measure. If the constraints are convex, this may be a "
+              "certificate of infeasibility in the sense of Observation 1 in "
+              "[4].");
+          sleipnir::println(
+              "Violated constraints (cᵢ(x) ≥ 0) in order of declaration (some "
+              "of these may have been converted from equality constraints):");
+          for (int row = 0; row < c_i.rows(); ++row) {
+            if (c_i(row) < 0.0) {
+              sleipnir::println("  {}/{}: {} ≥ 0", row + 1, c_i.rows(),
+                                c_i(row));
+            }
+          }
+        }
+
+        status->exitCondition = SolverExitCondition::kLocallyInfeasible;
+        return;
+      }
+
+      // Check for unboundedness/diverging iterates.
+      if (IsUnbounded(x, ε_unbd) || !x.allFinite() || !s.allFinite()) {
+        status->exitCondition = SolverExitCondition::kDivergingIterates;
+        return;
+      }
+
+      bool aggressiveStep;
+      // The Lagrangian gradient ∇ₓL_{γμ}(x, y); used to compute both aggressive
+      // and stabilizing steps. The value of γ depends on whether this is an
+      // aggressive or stabilizing step. See equation (7) in [4].
+      Eigen::VectorXd b_D;
+      if (innerIterCounter == 0) {
+        // This is again a special case so that we use the constraint
+        // Jacobian we've already computed instead of doing more autodiff
+        aggressiveStep = IsAggressiveStepAppropriate(y, s, g, A_i, μ, β_1, β_3);
+        b_D = ManualGradientModifiedLagrangian(
+            g, A_i, y, (aggressiveStep ? 1.0 : 0.0) * μ, β_1);
+      } else {
+        aggressiveStep = IsAggressiveStepAppropriate(
+            y, s, g, gradientComplimentarityValue, gradientConstraintSumValue,
+            μ, β_1, β_3);
+        b_D = ManualGradientModifiedLagrangian(
+            g, gradientComplimentarityValue, gradientConstraintSumValue,
+            (aggressiveStep ? 1.0 : 0.0) * μ, β_1);
+      }
+      if (aggressiveStep) {
+        // Compute an affine-scaling step and use the result to select a barrier
+        // multipler γ (which is a centering parameter locally/in the linear
+        // case) using Mehrotra's predictor-corrector heuristic, as in [6].
+        const auto [d_x, d_y] = PrimalDualStep(solver, y, yHat, s, sHat, w, b_D, A_i, μ, 0);
+	
+      } else {
+        // TODO(declan)
+      }
+
+      // Check for max wall clock time
+      const auto innerIterEndTime = std::chrono::system_clock::now();
+      if (innerIterEndTime - solveStartTime > config.timeout) {
+        status->exitCondition = SolverExitCondition::kTimeout;
+        return;
+      }
+
+      // Diagnostics for current outer iteration
+      if (config.diagnostics) {
+        /* if (iterations % 20 == 0) {
+          sleipnir::println("{:^4}   {:^9}  {:^13}  {:^13}  {:^13}", "iter",
+                            "time (ms)", "error", "cost", "infeasibility");
+          sleipnir::println("{:=^61}", "");
+        }
+
+        sleipnir::println("{:4}  {:9.3f}  {:13e}  {:13e}  {:13e}", iterations,
+                          ToMilliseconds(innerIterEndTime - innerIterStartTime),
+                          E_0, f.Value(),
+                          c_e.lpNorm<1>() + (c_i - s).lpNorm<1>()); */
+      }
     }
+
+    // xₖ₊₁ = xₖ + αₖpₖˣ
+    // sₖ₊₁ = sₖ + αₖpₖˢ
+    // yₖ₊₁ = yₖ + αₖᶻpₖʸ
+    // TODO(declan): not exactly like this for one-phase
+    // x += α * p_x;
+    // s += α * p_s;
+    // y += α_z * p_y;
+
+    ++iterations;
 
     // The search direction has been very small twice, so assume the problem has
     // been solved as well as possible given finite precision and reduce the

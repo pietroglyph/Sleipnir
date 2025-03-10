@@ -16,40 +16,31 @@
 namespace sleipnir {
 
 /**
-Finds the optimal solution to a nonlinear program using the interior-point
-method.
+Finds the optimal solution to an nonlinear program using the Hinder and Ye's
+one-phase interior-point method [4].
 
-A nonlinear program has the form:
+We expect a nonlinear program in the following form:
 
 @verbatim
      min_x f(x)
-subject to cₑ(x) = 0
-           cᵢ(x) ≥ 0
+subject to c(x) ≤ 0
 @endverbatim
 
-where f(x) is the cost function, cₑ(x) are the equality constraints, and cᵢ(x)
-are the inequality constraints.
+where f(x) is the cost function and c(x) are inequality constraints.
 
 @param[in] decisionVariables The list of decision variables.
-@param[in] equalityConstraints The list of equality constraints.
 @param[in] inequalityConstraints The list of inequality constraints.
 @param[in] f The cost function.
 @param[in] callback The user callback.
 @param[in] config Configuration options for the solver.
-@param[in] feasibilityRestoration Whether to use feasibility restoration instead
-  of the normal algorithm.
 @param[in,out] x The initial guess and output location for the decision
   variables.
-@param[in,out] s The initial guess and output location for the inequality
-  constraint slack variables.
 @param[out] status The solver status.
 */
 SLEIPNIR_DLLEXPORT void InteriorPoint(
     std::span<Variable> decisionVariables,
-    std::span<Variable> equalityConstraints,
     std::span<Variable> inequalityConstraints, Variable& f,
     function_ref<bool(const SolverIterationInfo& info)> callback,
-    const SolverConfig& config, bool feasibilityRestoration, Eigen::VectorXd& x,
-    Eigen::VectorXd& s, SolverStatus* status);
+    const SolverConfig& config, Eigen::VectorXd& x, SolverStatus* status);
 
 }  // namespace sleipnir

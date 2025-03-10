@@ -24,9 +24,6 @@ enum class SolverExitCondition : int8_t {
   kTooFewDOFs = -1,
   /// The solver determined the problem to be locally infeasible and gave up.
   kLocallyInfeasible = -2,
-  /// The solver failed to reach the desired tolerance, and feasibility
-  /// restoration failed to converge.
-  kFeasibilityRestorationFailed = -3,
   /// The solver encountered nonfinite initial cost or constraints and gave up.
   kNonfiniteInitialCostOrConstraints = -4,
   /// The solver encountered diverging primal iterates xₖ and/or sₖ and gave up.

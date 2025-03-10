@@ -13,6 +13,10 @@ namespace sleipnir {
  * Solver configuration.
  */
 struct SLEIPNIR_DLLEXPORT SolverConfig {
+  /// The solver will scale its initial estimate of the barrier parameter by
+  /// this value, which should be in (0, ∞).
+  double initialBarrierScale = 1.0;
+
   /// The solver will stop once the error is below this tolerance.
   double tolerance = 1e-8;
 
@@ -32,14 +36,6 @@ struct SLEIPNIR_DLLEXPORT SolverConfig {
   /// The maximum elapsed wall clock time before returning a solution.
   std::chrono::duration<double> timeout{
       std::numeric_limits<double>::infinity()};
-
-  /// Enables the feasible interior-point method. When the inequality
-  /// constraints are all feasible, step sizes are reduced when necessary to
-  /// prevent them becoming infeasible again. This is useful when parts of the
-  /// problem are ill-conditioned in infeasible regions (e.g., square root of a
-  /// negative value). This can slow or prevent progress toward a solution
-  /// though, so only enable it if necessary.
-  bool feasibleIPM = false;
 
   /// Enables diagnostic prints.
   bool diagnostics = false;

@@ -47,25 +47,19 @@ TEST_CASE("Bounds - Detection", "[Bounds]") {
       v - 6.5,
   });
 
+  // Assumes cᵢ(x) ≤ 0.
   constexpr auto correctBounds = std::to_array<std::pair<double, double>>({
       {-inf, 3},
       {-inf, -1},
       {1e-12, inf},
       {-inf, inf},
       {8, 6.5},
-  });  // Assumes c(x) ≤ 0.
-  static_assert(correctBounds.size() == decisionVariables.size());
-  constexpr auto correctBoundConstraintIndices = std::to_array<Eigen::Index>({
-      3,
-      4,
-      5,
-      7,
-      8,
-      9,
-      10,
-      11,
-      12,
   });
+  static_assert(correctBounds.size() == decisionVariables.size());
+  const Eigen::Vector<double, constraintVariables.size()>
+      correctBoundConstraintMask{
+          1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+      };
   constexpr auto correctConflictingBounds =
       std::to_array<std::pair<Eigen::Index, Eigen::Index>>({
           {9, 11},
@@ -76,15 +70,13 @@ TEST_CASE("Bounds - Detection", "[Bounds]") {
   sleipnir::VariableMatrix cAD{constraintVariables};
   sleipnir::Jacobian jacobianC{cAD, xAD};
   Eigen::SparseMatrix<double> A = jacobianC.Value();
-  const auto [boundConstraintIndices, decisionVarToBounds, conflictingBounds] =
+  const auto [boundConstraintMask, decisionVarToBounds, conflictingBounds] =
       sleipnir::GetBounds(decisionVariables, constraintVariables, A);
 
   using Catch::Matchers::UnorderedRangeEquals;
   CHECK_THAT(decisionVarToBounds, UnorderedRangeEquals(correctBounds));
-  CHECK_THAT(boundConstraintIndices,
-               UnorderedRangeEquals(correctBoundConstraintIndices));
-  CHECK_THAT(conflictingBounds,
-               UnorderedRangeEquals(correctConflictingBounds));
+  CHECK(boundConstraintMask == correctBoundConstraintMask);
+  CHECK_THAT(conflictingBounds, UnorderedRangeEquals(correctConflictingBounds));
 }
 
 TEST_CASE("Bounds - Projection", "[Bounds]") {

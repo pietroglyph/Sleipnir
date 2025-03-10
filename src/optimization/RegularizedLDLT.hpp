@@ -123,8 +123,7 @@ class RegularizedLDLT {
       τ = 0;
     }
 
-    Eigen::SparseMatrix<double> sparseEye =
-        Eigen::SparseMatrix<double>(lhs.rows(), lhs.cols());
+    Eigen::SparseMatrix<double> sparseEye{lhs.rows(), lhs.cols()};
     sparseEye.setIdentity();
     δ = std::max(m_δOld * Δ_dec, Δ_min - τ);
     while (true) {

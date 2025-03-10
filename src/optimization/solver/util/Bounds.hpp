@@ -29,8 +29,7 @@ namespace sleipnir {
  *   cᵢ(decisionVariables) ≤ 0.
  * @param A_i The Jacobian of inequalityConstraints wrt decisionVariables.
  */
-inline std::tuple<small_vector<Eigen::Index>,
-                  small_vector<std::pair<double, double>>,
+inline std::tuple<Eigen::VectorXd, small_vector<std::pair<double, double>>,
                   small_vector<std::pair<Eigen::Index, Eigen::Index>>>
 GetBounds(const std::span<Variable> decisionVariables,
           const std::span<Variable> inequalityConstraints,
@@ -51,8 +50,8 @@ GetBounds(const std::span<Variable> decisionVariables,
   small_vector<std::pair<Eigen::Index, Eigen::Index>>
       decisionVarToConstraintIndices{decisionVariables.size(), {-1, -1}};
   // We return these three
-  small_vector<Eigen::Index>
-      boundConstraintIndices;  // Includes redundant bound constraints
+  Eigen::VectorXd boundConstraintMask{inequalityConstraints.size()};
+  boundConstraintMask.fill(1.0);
   small_vector<std::pair<double, double>> decisionVarToBounds{
       decisionVariables.size(),
       {-std::numeric_limits<double>::infinity(),
@@ -60,8 +59,8 @@ GetBounds(const std::span<Variable> decisionVariables,
   small_vector<std::pair<Eigen::Index, Eigen::Index>> conflictingBounds;
   for (decltype(inequalityConstraints)::size_type constraintIndex = 0;
        constraintIndex < inequalityConstraints.size(); constraintIndex++) {
-    // Claim: A constraint is a bound iff it's linear and its gradient has a
-    // single nonzero value.
+    // Claim: A constraint is a bound iff it's a linear function in one variable
+    // and its gradient has a single nonzero value.
     if (inequalityConstraints[constraintIndex].Type() !=
         ExpressionType::kLinear) {
       continue;
@@ -106,7 +105,11 @@ GetBounds(const std::span<Variable> decisionVariables,
     auto& [lowerBound, upperBound] = decisionVarToBounds[decisionVariableIndex];
     auto& [lowerIndex, upperIndex] =
         decisionVarToConstraintIndices[decisionVariableIndex];
-    // Assumes c(x) ≤ 0.
+    // Let xⱼ = decisionVariables[decisionVariableIndex]; we have
+    //   constraintCoefficient * xⱼ + constraintConstant ≤ 0,
+    // which implies that
+    //   xⱼ ≤ -constraintConstant/constraintCoefficient,
+    // assuming cᵢ(x) ≤ 0.
     const auto detectedBound = -constraintConstant / constraintCoefficient;
     if (constraintCoefficient < 0 && detectedBound > lowerBound) {
       lowerBound = detectedBound;
@@ -122,9 +125,9 @@ GetBounds(const std::span<Variable> decisionVariables,
     }
 
     // We track this to set wⱼ = 0 later
-    boundConstraintIndices.emplace_back(constraintIndex);
+    boundConstraintMask[constraintIndex] = 0;
   }
-  return {boundConstraintIndices, decisionVarToBounds, conflictingBounds};
+  return {boundConstraintMask, decisionVarToBounds, conflictingBounds};
 }
 
 /**
@@ -141,20 +144,21 @@ GetBounds(const std::span<Variable> decisionVariables,
  *   the difference between the upper and lower bound is large (including when
  *   one of the bounds is ±∞).
  */
-template <typename Derived>
-  requires(static_cast<bool>(Eigen::DenseBase<Derived>::IsVectorAtCompileTime))
+template <typename D>
+  requires(EigenMatrixLike<D> &&
+           static_cast<bool>(Eigen::MatrixBase<D>::IsVectorAtCompileTime))
 inline void ProjectOntoBounds(
-    Eigen::DenseBase<Derived>& x,
-    const std::span<std::pair<typename Eigen::DenseBase<Derived>::Scalar,
-                              typename Eigen::DenseBase<Derived>::Scalar>>
+    Eigen::MatrixBase<D>& x,
+    const std::span<const std::pair<typename Eigen::MatrixBase<D>::Scalar,
+                                    typename Eigen::MatrixBase<D>::Scalar>>
         bounds,
-    const typename Eigen::DenseBase<Derived>::Scalar κ_1 = 1e-2,
-    const typename Eigen::DenseBase<Derived>::Scalar κ_2 = 1e-2) {
+    const typename Eigen::MatrixBase<D>::Scalar κ_1 = 1e-2,
+    const typename Eigen::MatrixBase<D>::Scalar κ_2 = 1e-2) {
   Assert(κ_1 > 0 && κ_2 > 0 && κ_2 < 0.5);
 
   Eigen::Index idx = 0;
   for (const auto& [lower, upper] : bounds) {
-    typename Eigen::DenseBase<Derived>::Scalar& x_i = x[idx++];
+    typename Eigen::MatrixBase<D>::Scalar& x_i = x[idx++];
 
     // We assume that bound infeasibility is handled elsewhere.
     Assert(lower <= upper);
@@ -162,7 +166,7 @@ inline void ProjectOntoBounds(
     // See B.2 in [4] and section 3.6 in [2]; compare to
     // https://github.com/ohinder/OnePhase.jl/blob/4863f8146f1454c353118b3f12b1784dfea60032/src/init/primal-project.jl#L1-L68,
     // which writes this in equivalent way that is more concise but less
-    // efficient. Although the equations are the same as in [2], since we
+    // clear. Although the equations are the same as in [2], since we
     // convert equalities to bounds, this results into projecting exactly onto
     // the equalities.
     if (std::isfinite(lower) && std::isfinite(upper)) {
@@ -179,8 +183,4 @@ inline void ProjectOntoBounds(
   }
 }
 
-/*inline void InitialIterateEstimate(Eigen::VectorXd& x_0,
-                                   std::span<Variable> decisionVariables,
-                                   std::span<Variable> inequalityConstraints,
-                                   const Eigen::SparseMatrix<double>& A_i) {}*/
 }  // namespace sleipnir
