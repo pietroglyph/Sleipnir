@@ -1,6 +1,6 @@
 # Internal algorithms
 
-This document contains internal algorithm documentation for Sleipnir.
+This document contains internal algorithm documentation for Sleipnir. We assume that all costs (objectives) take the form f : **R**ⁿ → **R** and that all constraints take the form c : **R**ᵐ → **R**ᵐ, and that all cost and constraint functions are continuously differentiable.
 
 ## Reverse accumulation automatic differentiation
 
@@ -177,72 +177,141 @@ Section 6 of [^3] describes how to check for local infeasibility.
 
 ## Log-domain interior-point method
 
-We want to solve the following optimization problem.
+We want to solve the following optimization problem <a name="original-ipm-problem">(1)</a>
 
 ```
-   min f(x)
+   min f(x),
     x
   s.t. cₑ(x) = 0
-       cᵢ(x) ≥ 0
+       ĉᵢ(x) ≥ 0
 ```
 
-where f(x) is the cost function, cₑ(x) is the equality constraints, and cᵢ(x) is the inequality constraints. First, we'll reformulate the inequality constraints as equality constraints with slack variables.
+where f(x) is the cost function, cₑ(x) is the vector of equality constraints, and ĉᵢ(x) is vector of inequality constraints.
+
+We'll reformulate the equality constraints as two inequality constraints: that is, we define a new inequality constraint vector cᵢ(x) = concat(cₑ(x), −cₑ(x), ĉᵢ(x)) (also see the end of section 2 of [6] for more information on this unusual choice). This gives a new but equivalent problem
 
 ```
-   min f(x)
+   min f(x),
     x
-  s.t. cₑ(x) = 0
-       cᵢ(x) − s = 0
-       s ≥ 0
+  s.t. cᵢ(x) ≥ 0.
 ```
 
-To make this easier to solve, we'll reformulate it as the following barrier problem.
+We would like to control the rate at which we reduce the primal feasibility since, for reasons outlined in [7], we would like the rate of decrease to be proportional to the rate at which we decrease complimentarity. We can achieve this by making primal feasibility and complimentarity proportional to a parameter μ ∈ (0, ∞), since for a sequence of these parameters (μₖ)ₖ ⊆ (0, ∞), the rate of decrease in complimentarity and primal feasibility will be μₖ₊₁/μₖ for all k ∈ **Z**₊ if and only if the respective proportionality constants are fixed across iterations. We choose such a constant w ∈ **R**ᵐ to be fixed across iterations and define a new modified problem <a name="homotopy-ipm-problem">(2)</a>
+
 
 ```
-  min f(x) − μ Σ ln(sᵢ)
-   x           i
-  s.t. cₑ(x) = 0
-       cᵢ(x) − s = 0
+   min f(x),
+    x
+  s.t. cᵢ(x) ≥ μw;
 ```
 
-where μ is the barrier parameter. As μ → 0, the solution of the barrier problem approaches the solution of the original problem.
+note that in the above problem, μ only controls the rate of decrease of primal feasibility and *not* complimentarity, which is a goal we will return to later.
+
+Also note that problem [(2)](#homotopy-ipm-problem) is equivalent to the original problem [(1)](#original-ipm-problem) if and only if μ = 0
+
+We can eliminate the inequality constraints by adding a "log-barrier term" to the objective which penalizes constraint violation---this gives a new modified problem <a name="primal-log-barrier-ipm-problem">(3)</a>
+
+```
+   min f(x) - μ ∑ ln[(cᵢ)ⱼ − μwⱼ].
+    x           j
+```
+
+In general, the above problem is neither equivalent to the first modified problem [(2)](#homotopy-ipm-problem) nor to the original problem [(1)](#original-ipm-problem) for any μ. At this point, we could solve a sequence of these primal log-barrier problems with decreasing barrier parameters with any unconstrained optimization algorithm. This is one of the reasons we have also scaled the log-barrier by μ since it makes the log-barrier vanish as μ vanishes (there is another important reason under a different problem formulation, which we will return to shortly).
+
+For reasons outlined in section 19.6 of [1], the primal log-barrier objective is highly nonlinear as μ approaches 0 which results in slow convergence when solving a series of primal log-barrier problems [(3)][#primal-log-barrier-ipm-problem]. To deal with this issue, we define "slack variables" s = cᵢ(x) which we add to and substitute into problem [(3)](#primal-log-barrier-ipm-problem) 
+
+
+<!-- We give up on the above primal log-barrier problem [(3)](#primal-log-barrier-ipm-problem) due to the nonlinearity, but we include it above because it is the objective they show in [6]. We still want to control the rate of decrease in primal feasibility, so we define "slack variables" s = cᵢ(x) which we add to and substitute into problem [(2)](#homotopy-ipm-problem) to get an equivalent problem <a name="slack-homotopy-ipm-problem">(4)</a>
+
+```
+   min f(x).
+   x,s
+  s.t. s = cᵢ(x) (⇔ cᵢ(x) − s = 0)
+       s ≥ μw    (⇔ s − μw ≥ 0)
+``` -->
+
+Note that the state is now (x, s) ∈ **R**ⁿ × **R**ᵐ, and that this is not equivalent to the original problem [(1)](#original-ipm-problem), although again we could solve a sequence of these problems as μ → 0. Indeed, the final algorithm we derive in the remainder of the section can also be derived as a homotopy method applied to the KKT conditions of the above problem (see section 19.1 in [1] for some information on this duality.) 
+
+Instead of deriving our algorithm as a homotopy method, will will derive it as a barrier method (we need to find the barrier objective since it ends up being our merit function): we again eliminate the inequality constraints (now on the slack s) by adding a log-barrier term to the objective, which gives a new modified, non-equivalent problem <a name="primal-dual-log-barrier-ipm-problem">(5)</a>
+
+```
+   min f(x) - μ ∑ ln[sⱼ − μwⱼ].
+   x,s          j
+   s.t. cᵢ(x) − s = 0
+```
+
+Note that, as in [(3)](#primal-log-barrier-ipm-problem), we have placed the same primal feasibility decrease control term μ outside the sum. As mentioned previously, this allows the sequence of solutions to [(5)](#primal-dual-log-barrier-ipm-problem) to approach the solution to the original problem since as μ vanishes the log-barrier vanishes, which is why μ is traditionally called the barrier parameter. We will also show in the next section that scaling the sum by μ also causes μ to control the rate of decrease in complimentarity, which achieves our goal of decreasing complimentarity and primal feasibility at the same rate.
+
+<!-- where μ is the barrier parameter, β₁ ∈ **R**, and w ∈ [0, ∞)ⁿ is a vector parameter fixed across iterations which we will examine in more detail later. Take care to note that the state is now (x, s)∈ **R**ⁿ × **R**ᵐ. -->
+
+Finally, following [7], we add another term to the sum to bound each summand below so that the primal iterates do not spuriously diverge, which gives the following problem <a name="shifted-primal-dual-log-barrier-ipm-problem">(6)</a>
+
+```
+  min f(x) − μ ∑ [β₁(cᵢ)ⱼ(x) + ln(μwⱼ + sⱼ)],  (*)
+  x,s          j
+  s.t. cᵢ(x) - s = 0
+```
+
+where β₁ ∈ **R**.
 
 ### Lagrangian
 
-The Lagrangian of the barrier problem is
+The Lagrangian of the final barrier problem [(6)](#shifted-primal-dual-log-barrier-ipm-problem) is
 
 ```
-  L(x, s, y, z) = f(x) − μ Σ ln(sᵢ) − yᵀcₑ(x) − zᵀ(cᵢ(x) − s)
-                           i
+  L(x, s, z) = f(x) − μ ∑ [β₁(cᵢ)ⱼ(x) + ln(μwⱼ + sⱼ)] − zᵀ(cᵢ(x) - s)
+                        j
 ```
 
 ### Gradients of the Lagrangian
 
-The gradients are
+The gradient of the Lagrangian of the barrier problem [(6)](#shifted-primal-dual-log-barrier-ipm-problem) with respect to the state (x, s) ∈ **R**ⁿ × **R**ᵐ is
 
 ```
-  ∇ₓL(x, s, y, z) = ∇f − Aₑᵀy − Aᵢᵀz
-  ∇ₛL(x, s, y, z) = z − μS⁻¹e
-  ∇_yL(x, s, y, z) = −cₑ
-  ∇_zL(x, s, y, z) = −cᵢ + s
+  ∇ₓL(x, s, z) = ∇f − Aᵢᵀ(z - μβ₁e)
+  ∇ₛL(x, s, z) = z − μ diag(s + μw)⁻¹e
 ```
 
-The first-order necessary conditions for optimality are
+where ∇f = ∇f(x), Aᵢ = ∂cᵢ/∂x, and e is a column vector of ones.
+
+We will now write the first-order necessary conditions: if (x, s) ∈ **R**ⁿ × **R**ᵐ is a local solution to the barrier problem [(6)](#shifted-primal-dual-log-barrier-ipm-problem) at which an appropriate constraint qualification holds, then there exists a Lagrange multiplier z ∈ **R**ᵐ such that
 
 ```
-  ∇f − Aₑᵀy − Aᵢᵀz = 0
-  z − μS⁻¹e = 0
-  −cₑ = 0
-  −cᵢ + s = 0
+  ∇ₓL(x, s, z) = ∇f − Aᵢᵀ(z - μβ₁e) = 0
+  ∇ₛL(x, s, z) = z − μ diag(s + μw)⁻¹e = 0
+  Z(cᵢ − s) = 0
+  cᵢ - s = 0
+  z ≥ 0,
 ```
 
-where Aₑ = ∂cₑ/∂x, Aᵢ = ∂cᵢ/∂x, S = diag(s), and e is a column vector of ones. We'll rearrange them for the primal-dual system.
+where cᵢ = cᵢ(x).
+
+```
+  z − μ diag(s + μw)⁻¹e = 0 ⇔  z = μ diag(s + μw)⁻¹e ⇔  diag(z) = Z = μ diag(s + μw)⁻¹
+  Z(cᵢ − s) = 0
+imply
+  μ diag(s + μw)⁻¹(cᵢ − s) = 0
+implies
+  μ diag(s + μw)⁻¹cᵢ - 
+```
+
+
+We will simplify these conditions to make it easier to apply Newton's method to the equalities. If we let S = diag(s) and W = diag(w), then 
+
+```
+  z − μ diag(s + μw)⁻¹e = 0
+  diag(s + μw) z        = μe
+  Sz + μWz              = μe
+  (S + μW)z             = μe
+  μ⁻¹Sz + Wz            =  e
+```
 
 ```
   ∇f − Aₑᵀy − Aᵢᵀz = 0
   Sz − μe = 0
   cₑ = 0
   cᵢ − s = 0
+  s ≥ 0
 ```
 
 To ensure s ≥ 0 and z ≥ 0, make the following substitutions.
@@ -390,3 +459,7 @@ Section 6 of [^3] describes how to check for local infeasibility.
 [^4]: Gu, C. and Zhu, D. "A Dwindling Filter Algorithm with a Modified Subproblem for Nonlinear Inequality Constrained Optimization", 2014. [https://sci-hub.st/10.1007/s11401-014-0826-z](https://sci-hub.st/10.1007/s11401-014-0826-z)
 
 [^5]: Permenter, F. "Log-domain interior-point methods for convex quadratic programming", 2022. [https://arxiv.org/pdf/2212.02294](https://arxiv.org/pdf/2212.02294)
+
+[^6]: https://arxiv.org/pdf/1707.07327
+
+[^7]: https://arxiv.org/pdf/1801.03072
