@@ -78,8 +78,6 @@ ExitStatus Problem::solve(const Options& options, [[maybe_unused]] bool spy) {
   int num_decision_variables = m_decision_variables.size();
   [[maybe_unused]]
   int num_equality_constraints = m_equality_constraints.size();
-  [[maybe_unused]]
-  int num_inequality_constraints = m_inequality_constraints.size();
 
   // Solve the optimization problem
   ExitStatus status;
@@ -201,25 +199,45 @@ ExitStatus Problem::solve(const Options& options, [[maybe_unused]] bool spy) {
       slp::println("\nInvoking IPM solver...\n");
     }
 
-    VariableMatrix c_e_ad{m_equality_constraints};
-    VariableMatrix c_i_ad{m_inequality_constraints};
+    // Check for overconstrained problem
+    if (num_equality_constraints > num_decision_variables) {
+      if (options.diagnostics) {
+        print_too_few_dofs_error(
+            VariableMatrix{m_equality_constraints}.value());
+      }
 
-    // Set up equality constraint Jacobian autodiff
-    ad_setup_profilers.emplace_back("  ↳ ∂cₑ/∂x").start();
-    Jacobian A_e{c_e_ad, x_ad};
-    ad_setup_profilers.back().stop();
+      return ExitStatus::TOO_FEW_DOFS;
+    }
+
+    // Convert each equality constraint into two inequality constraints
+    gch::small_vector<Variable> combined_inequality_constraints;
+    combined_inequality_constraints.reserve(m_inequality_constraints.size() +
+                                            2 * m_equality_constraints.size());
+    std::copy(m_inequality_constraints.begin(), m_inequality_constraints.end(),
+              combined_inequality_constraints.begin());
+    for (const auto& eq_constraint : m_inequality_constraints) {
+      combined_inequality_constraints.emplace_back(eq_constraint);
+      combined_inequality_constraints.emplace_back(-eq_constraint);
+    }
+    const int num_inequality_constraints =
+        combined_inequality_constraints.size();
+
+    VariableMatrix c_i_ad{combined_inequality_constraints};
 
     // Set up inequality constraint Jacobian autodiff
     ad_setup_profilers.emplace_back("  ↳ ∂cᵢ/∂x").start();
     Jacobian A_i{c_i_ad, x_ad};
     ad_setup_profilers.back().stop();
 
-    // Set up Lagrangian
-    VariableMatrix y_ad(num_equality_constraints);
+    // Set up Lagrangian for computing the Hessian
     VariableMatrix v_ad(num_inequality_constraints);
-    Variable sqrt_μ_ad;
-    Variable L = f - (y_ad.T() * c_e_ad)[0] -
-                 sqrt_μ_ad * (v_ad.cwise_transform(&slp::exp).T() * c_i_ad)[0];
+    Variable μ_ad, β_1_ad;
+    const auto e = VariableMatrix::ones(num_inequality_constraints, 1);
+    // Since this is only used for computing the Hessian, we pre-remove terms
+    // which will vanish.
+    Variable L =
+        f - c_i_ad.T() * (slp::sqrt(μ_ad) * v_ad.cwise_transform(&slp::exp) -
+                          μ_ad * β_1_ad * e);
 
     // Set up Lagrangian Hessian autodiff
     ad_setup_profilers.emplace_back("  ↳ ∇²ₓₓL").start();
@@ -231,24 +249,18 @@ ExitStatus Problem::solve(const Options& options, [[maybe_unused]] bool spy) {
 #ifndef SLEIPNIR_DISABLE_DIAGNOSTICS
     // Sparsity pattern files written when spy flag is set
     std::unique_ptr<Spy> H_spy;
-    std::unique_ptr<Spy> A_e_spy;
     std::unique_ptr<Spy> A_i_spy;
 
     if (spy) {
       H_spy = std::make_unique<Spy>(
           "H.spy", "Hessian", "Decision variables", "Decision variables",
           num_decision_variables, num_decision_variables);
-      A_e_spy = std::make_unique<Spy>("A_e.spy", "Equality constraint Jacobian",
-                                      "Constraints", "Decision variables",
-                                      num_equality_constraints,
-                                      num_decision_variables);
       A_i_spy = std::make_unique<Spy>(
           "A_i.spy", "Inequality constraint Jacobian", "Constraints",
           "Decision variables", num_inequality_constraints,
           num_decision_variables);
       m_iteration_callbacks.push_back([&](const IterationInfo& info) -> bool {
         H_spy->add(info.H);
-        A_e_spy->add(info.A_e);
         A_i_spy->add(info.A_i);
         return false;
       });
@@ -256,7 +268,8 @@ ExitStatus Problem::solve(const Options& options, [[maybe_unused]] bool spy) {
 #endif
 
     const auto [bound_constraint_mask, bounds, conflicting_bound_indices] =
-        get_bounds(m_decision_variables, m_inequality_constraints, A_i.value());
+        get_bounds(m_decision_variables, combined_inequality_constraints,
+                   A_i.value());
     if (!conflicting_bound_indices.empty()) {
       if (options.diagnostics) {
         print_bound_constraint_global_infeasibility_error(
@@ -296,22 +309,13 @@ ExitStatus Problem::solve(const Options& options, [[maybe_unused]] bool spy) {
               x_ad.set_value(x);
               return g.value();
             },
-            [&](const Eigen::VectorXd& x, const Eigen::VectorXd& y,
-                const Eigen::VectorXd& v,
-                double sqrt_μ) -> Eigen::SparseMatrix<double> {
+            [&](const Eigen::VectorXd& x, const Eigen::VectorXd& v, double μ,
+                double β_1) -> Eigen::SparseMatrix<double> {
               x_ad.set_value(x);
-              y_ad.set_value(y);
               v_ad.set_value(v);
-              sqrt_μ_ad.set_value(sqrt_μ);
+              μ_ad.set_value(μ);
+              β_1_ad.set_value(β_1);
               return H.value();
-            },
-            [&](const Eigen::VectorXd& x) -> Eigen::VectorXd {
-              x_ad.set_value(x);
-              return c_e_ad.value();
-            },
-            [&](const Eigen::VectorXd& x) -> Eigen::SparseMatrix<double> {
-              x_ad.set_value(x);
-              return A_e.value();
             },
             [&](const Eigen::VectorXd& x) -> Eigen::VectorXd {
               x_ad.set_value(x);

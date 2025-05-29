@@ -244,17 +244,6 @@ static const char *__doc_slp_InequalityConstraints_operator_bool = R"doc(Implici
 
 static const char *__doc_slp_InteriorPointMatrixCallbacks = R"doc(Matrix callbacks for the interior-point method solver.)doc";
 
-static const char *__doc_slp_InteriorPointMatrixCallbacks_A_e =
-R"doc(Equality constraint Jacobian ∂cₑ/∂x getter.
-
-@verbatim [∇ᵀcₑ₁(xₖ)] Aₑ(x) = [∇ᵀcₑ₂(xₖ)] [ ⋮ ] [∇ᵀcₑₘ(xₖ)]
-@endverbatim
-
-<table> <tr> <th>Variable</th> <th>Rows</th> <th>Columns</th> </tr>
-<tr> <td>x</td> <td>num_decision_variables</td> <td>1</td> </tr> <tr>
-<td>Aₑ(x)</td> <td>num_equality_constraints</td>
-<td>num_decision_variables</td> </tr> </table>)doc";
-
 static const char *__doc_slp_InteriorPointMatrixCallbacks_A_i =
 R"doc(Inequality constraint Jacobian ∂cᵢ/∂x getter.
 
@@ -267,23 +256,21 @@ R"doc(Inequality constraint Jacobian ∂cᵢ/∂x getter.
 <td>num_decision_variables</td> </tr> </table>)doc";
 
 static const char *__doc_slp_InteriorPointMatrixCallbacks_H =
-R"doc(Lagrangian Hessian ∇ₓₓ²L(x, y, v, √(μ)) getter.
+R"doc(Lagrangian Hessian ∇ₓₓ²L(x, v, μ, β₁) getter, where
 
-L(xₖ, yₖ, zₖ) = f(xₖ) − yₖᵀcₑ(xₖ) − √(μ)eᵛᵀcᵢ(xₖ)
+L(x, s, z, μ) = f(x) − μ ∑ [β₁(cᵢ)ⱼ(x) − ln(√(μ))vⱼ] − √(μ)eᵛᵀ(cᵢ(x) −
+√(μ)e⁻ᵛ + μw), j
 
-<table> <tr> <th>Variable</th> <th>Rows</th> <th>Columns</th> </tr>
-<tr> <td>x</td> <td>num_decision_variables</td> <td>1</td> </tr> <tr>
-<td>y</td> <td>num_equality_constraints</td> <td>1</td> </tr> <tr>
-<td>z</td> <td>num_inequality_constraints</td> <td>1</td> </tr> <tr>
-<td>∇ₓₓ²L(x, y, z)</td> <td>num_decision_variables</td>
-<td>num_decision_variables</td> </tr> </table>)doc";
+∇ₓL(x, v, μ, β₁) = ∇ₓf(x) − Aᵢ(x)ᵀ(√(μ)eᵛ − μβ₁e),
 
-static const char *__doc_slp_InteriorPointMatrixCallbacks_c_e =
-R"doc(Equality constraint value cₑ(x) getter.
+∇ₓₓ²L(x, v, μ, β₁) = ∇ₓₓ²f(x) − ∇ₓₓ²cᵢ(x)ᵀ(√(μ)eᵛ − μβ₁e).
 
 <table> <tr> <th>Variable</th> <th>Rows</th> <th>Columns</th> </tr>
 <tr> <td>x</td> <td>num_decision_variables</td> <td>1</td> </tr> <tr>
-<td>cₑ(x)</td> <td>num_equality_constraints</td> <td>1</td> </tr>
+<td>v</td> <td>num_inequality_constraints</td> <td>1</td> </tr> <tr>
+<td>μ</td> <td>1</td> <td>1</td> </tr> <tr> <td>β₁</td> <td>1</td>
+<td>1</td> </tr> <tr> <td>∇ₓₓ²L(x, y, z, μ, β₁)</td>
+<td>num_decision_variables</td> <td>num_decision_variables</td> </tr>
 </table>)doc";
 
 static const char *__doc_slp_InteriorPointMatrixCallbacks_c_i =
@@ -3094,10 +3081,10 @@ point method.
 
 A nonlinear program has the form:
 
-@verbatim min_x f(x) subject to cₑ(x) = 0 cᵢ(x) ≥ 0 @endverbatim
+@verbatim min_x f(x) subject to cᵢ(x) ≥ 0 @endverbatim
 
-where f(x) is the cost function, cₑ(x) are the equality constraints,
-and cᵢ(x) are the inequality constraints.
+where f(x) is the cost function and cᵢ(x) are the inequality
+constraints.
 
 Parameter ``matrix_callbacks``:
     Matrix callbacks.
